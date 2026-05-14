@@ -444,12 +444,22 @@ function renderResult(d) {
       </div>`;
   }
 
+  let bagHtml = '';
+  if (d.bag) {
+    const b = d.bag;
+    const bits = [];
+    if (b.bouwjaar) bits.push(`bouwjaar <strong>${b.bouwjaar}</strong>`);
+    if (b.gebruiksoppervlakte) bits.push(`<strong>${b.gebruiksoppervlakte} m²</strong>`);
+    if (b.gebruiksdoel) bits.push(b.gebruiksdoel);
+    if (bits.length) bagHtml = `<div class="meta">BAG: ${bits.join(' · ')}</div>`;
+  }
+
   result.innerHTML = `
     <h3>${d.weergavenaam}</h3>
     <div class="meta">
       WOZ-objectnummer ${d.wozobjectnummer || '—'} · nummeraanduiding ${d.nummeraanduiding || '—'}
-      ${d.grondoppervlakte ? ' · grondoppervlakte ' + d.grondoppervlakte + ' m²' : ''}
     </div>
+    ${bagHtml}
     ${energieHtml}
     <table>
       <thead><tr><th>Peildatum</th><th style="text-align:right">Vastgestelde waarde</th></tr></thead>

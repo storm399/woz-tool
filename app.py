@@ -52,6 +52,8 @@ WOZ_HEADERS = {
 EPO_API = "https://public.ep-online.nl/api/v5/PandEnergielabel/AdresseerbaarObject/{}"
 EPO_API_KEY = os.environ.get("EPONLINE_API_KEY", "").strip()
 
+BAG_WFS = "https://service.pdok.nl/lv/bag/wfs/v2_0"
+
 REQUEST_TIMEOUT = 15
 session = requests.Session()
 
@@ -84,6 +86,51 @@ def haal_woz(nummeraanduiding_id: str) -> Optional[dict]:
         r.raise_for_status()
         return r.json()
     except requests.RequestException:
+        return None
+
+
+def haal_bag(adresseerbaar_object_id: str) -> Optional[dict]:
+    """Haalt BAG-verblijfsobject op via PDOK WFS (geen API-key nodig).
+
+    Returnt dict met bouwjaar, gebruiksoppervlakte (m²), gebruiksdoel,
+    pandidentificatie en statussen.
+    """
+    if not adresseerbaar_object_id:
+        return None
+    fil = (
+        f"<Filter><PropertyIsEqualTo>"
+        f"<PropertyName>bag:identificatie</PropertyName>"
+        f"<Literal>{adresseerbaar_object_id}</Literal>"
+        f"</PropertyIsEqualTo></Filter>"
+    )
+    try:
+        r = session.get(
+            BAG_WFS,
+            params={
+                "service": "WFS",
+                "version": "2.0.0",
+                "request": "GetFeature",
+                "typeNames": "bag:verblijfsobject",
+                "outputFormat": "application/json",
+                "srsName": "EPSG:4326",
+                "filter": fil,
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        r.raise_for_status()
+        feats = r.json().get("features", [])
+        if not feats:
+            return None
+        p = feats[0].get("properties", {}) or {}
+        return {
+            "bouwjaar": p.get("bouwjaar"),
+            "gebruiksoppervlakte": p.get("oppervlakte"),
+            "gebruiksdoel": p.get("gebruiksdoel"),
+            "vbo_status": p.get("status"),
+            "pand_id": p.get("pandidentificatie"),
+            "pand_status": p.get("pandstatus"),
+        }
+    except (requests.RequestException, ValueError):
         return None
 
 
@@ -140,6 +187,7 @@ def maak_resultaat(adres: str) -> dict:
         return {"adres_invoer": adres, "status": "Geen nummeraanduiding", "wozWaarden": []}
 
     woz = haal_woz(nummeraanduiding)
+    bag = haal_bag(adresseerbaar_object_id) if adresseerbaar_object_id else None
     energielabel = haal_energielabel(adresseerbaar_object_id) if adresseerbaar_object_id else None
 
     if not woz:
@@ -150,6 +198,7 @@ def maak_resultaat(adres: str) -> dict:
             "adresseerbaarobject_id": adresseerbaar_object_id,
             "status": "Geen WOZ-waarde bekend (niet-woning of onbekend)",
             "wozWaarden": [],
+            "bag": bag,
             "energielabel": energielabel,
         }
 
@@ -178,6 +227,7 @@ def maak_resultaat(adres: str) -> dict:
             key=lambda x: x["peildatum"] or "",
             reverse=True,
         ),
+        "bag": bag,
         "energielabel": energielabel,
     }
 
@@ -320,14 +370,20 @@ def _bouw_excel(header_in, rows, resultaten, peildata_sorted) -> Workbook:
 
     invoer_kols = list(header_in) or ["adres"]
     locatie_kols = ["status", "gevonden adres", "postcode", "woonplaats", "BAG-id"]
-    label_kols = ["energielabel", "bouwjaar", "gebouwtype", "geldig t/m"]
+    bag_kols = ["bouwjaar", "gebr.oppervlakte (m²)", "gebruiksdoel"]
+    label_kols = ["energielabel", "gebouwtype", "geldig t/m"]
     woz_kols = [p[:4] for p in peildata_sorted]  # alleen jaartal
 
-    n_in, n_loc, n_lab, n_woz = len(invoer_kols), len(locatie_kols), len(label_kols), len(woz_kols)
+    n_in = len(invoer_kols)
+    n_loc = len(locatie_kols)
+    n_bag = len(bag_kols)
+    n_lab = len(label_kols)
+    n_woz = len(woz_kols)
 
     # Rij 1: groepheaders (merged)
     groepen = [("Invoer", n_in, "6B7785"),
                ("Adres & WOZ-object", n_loc, _RED_DARK),
+               ("BAG-gegevens", n_bag, "8B5A2B"),
                ("Energielabel (EP-online)", n_lab, "1B7A3A"),
                ("WOZ-waarden", n_woz, _RED_MID)]
     col = 1
@@ -346,7 +402,7 @@ def _bouw_excel(header_in, rows, resultaten, peildata_sorted) -> Workbook:
     ws.row_dimensions[1].height = 24
 
     # Rij 2: kolomheaders
-    headers_row2 = invoer_kols + locatie_kols + label_kols + woz_kols
+    headers_row2 = invoer_kols + locatie_kols + bag_kols + label_kols + woz_kols
     for i, h in enumerate(headers_row2, start=1):
         c = ws.cell(row=2, column=i, value=h)
         c.font = Font(bold=True, color="1F2933", size=10)
@@ -357,6 +413,7 @@ def _bouw_excel(header_in, rows, resultaten, peildata_sorted) -> Workbook:
 
     # Data
     for row, res in zip(rows[1:], resultaten):
+        bag = res.get("bag") or {}
         ep = res.get("energielabel") or {}
         out_row = list(row)
         # Pad indien rij korter dan header
@@ -368,8 +425,10 @@ def _bouw_excel(header_in, rows, resultaten, peildata_sorted) -> Workbook:
             res.get("postcode"),
             res.get("woonplaats"),
             res.get("adresseerbaarobject_id") or res.get("nummeraanduiding"),
+            bag.get("bouwjaar"),
+            bag.get("gebruiksoppervlakte"),
+            bag.get("gebruiksdoel"),
             ep.get("energieklasse"),
-            ep.get("bouwjaar"),
             ep.get("gebouwtype"),
             ep.get("geldig_tot"),
         ]
@@ -389,8 +448,8 @@ def _bouw_excel(header_in, rows, resultaten, peildata_sorted) -> Workbook:
             if r % 2 == 1:
                 cell.fill = PatternFill("solid", fgColor="FAFBFC")
 
-    # Kleur energielabel-cel (col na invoer+locatie)
-    label_col_idx = n_in + n_loc + 1  # 1-based
+    # Kleur energielabel-cel (col na invoer+locatie+bag)
+    label_col_idx = n_in + n_loc + n_bag + 1  # 1-based
     for r in range(3, max_row + 1):
         cell = ws.cell(row=r, column=label_col_idx)
         lab = (cell.value or "").strip() if isinstance(cell.value, str) else ""
@@ -401,7 +460,7 @@ def _bouw_excel(header_in, rows, resultaten, peildata_sorted) -> Workbook:
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
     # Euro-format + ColorScale voor WOZ-kolommen
-    woz_start = n_in + n_loc + n_lab + 1
+    woz_start = n_in + n_loc + n_bag + n_lab + 1
     woz_end = woz_start + n_woz - 1
     for c_idx in range(woz_start, woz_end + 1):
         for r in range(3, max_row + 1):
@@ -414,10 +473,14 @@ def _bouw_excel(header_in, rows, resultaten, peildata_sorted) -> Workbook:
                 end_type="max", end_color="9BB8DC",
             ))
 
-    # Bouwjaar als getal zonder duizendtal
-    bouwjaar_col = n_in + n_loc + 2
+    # BAG bouwjaar als getal zonder duizendtal, gebruiksoppervlakte centered
+    bouwjaar_col = n_in + n_loc + 1
+    oppervlakte_col = n_in + n_loc + 2
     for r in range(3, max_row + 1):
         ws.cell(row=r, column=bouwjaar_col).number_format = "0"
+        ws.cell(row=r, column=bouwjaar_col).alignment = Alignment(horizontal="center")
+        ws.cell(row=r, column=oppervlakte_col).number_format = "0"
+        ws.cell(row=r, column=oppervlakte_col).alignment = Alignment(horizontal="center")
 
     # Kolombreedtes — zinvolle defaults
     def set_width(col_letter, w):
@@ -428,9 +491,12 @@ def _bouw_excel(header_in, rows, resultaten, peildata_sorted) -> Workbook:
     locatie_widths = [11, 38, 10, 18, 18]
     for i, w in enumerate(locatie_widths):
         set_width(get_column_letter(n_in + 1 + i), w)
-    label_widths = [11, 10, 22, 12]
-    for i, w in enumerate(label_widths):
+    bag_widths = [10, 12, 22]
+    for i, w in enumerate(bag_widths):
         set_width(get_column_letter(n_in + n_loc + 1 + i), w)
+    label_widths = [11, 22, 12]
+    for i, w in enumerate(label_widths):
+        set_width(get_column_letter(n_in + n_loc + n_bag + 1 + i), w)
     for i in range(n_woz):
         set_width(get_column_letter(woz_start + i), 12)
 
@@ -466,11 +532,18 @@ def _bouw_excel(header_in, rows, resultaten, peildata_sorted) -> Workbook:
     for l in labels_lijst:
         label_count[l] = label_count.get(l, 0) + 1
 
-    bouwjaren = [(r.get("energielabel") or {}).get("bouwjaar") for r in resultaten]
+    # Bouwjaar uit BAG (autoritatief)
+    bouwjaren = [(r.get("bag") or {}).get("bouwjaar") for r in resultaten]
     bouwjaren = [b for b in bouwjaren if isinstance(b, int) and b > 1500]
     gem_bj = int(sum(bouwjaren) / len(bouwjaren)) if bouwjaren else None
     oudste = min(bouwjaren) if bouwjaren else None
     nieuwste = max(bouwjaren) if bouwjaren else None
+
+    opp = [(r.get("bag") or {}).get("gebruiksoppervlakte") for r in resultaten]
+    opp = [o for o in opp if isinstance(o, (int, float)) and o > 0]
+    gem_opp = round(sum(opp) / len(opp)) if opp else None
+    min_opp = min(opp) if opp else None
+    max_opp = max(opp) if opp else None
 
     laatste_peildatum = peildata_sorted[0] if peildata_sorted else "—"
 
@@ -488,11 +561,17 @@ def _bouw_excel(header_in, rows, resultaten, peildata_sorted) -> Workbook:
             ("Hoogste", max_woz),
         ]),
         ("Energielabels", [(f"Label {k}", v) for k, v in sorted(label_count.items())] or [("Geen labels gevonden", 0)]),
-        ("Bouwjaar", [
+        ("Bouwjaar (BAG)", [
             ("Aantal met bouwjaar", len(bouwjaren)),
             ("Gemiddeld", gem_bj),
             ("Oudst", oudste),
             ("Nieuwst", nieuwste),
+        ]),
+        ("Gebruiksoppervlakte (BAG, m²)", [
+            ("Aantal met oppervlakte", len(opp)),
+            ("Gemiddeld", gem_opp),
+            ("Kleinst", min_opp),
+            ("Grootst", max_opp),
         ]),
     ]
 
