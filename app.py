@@ -9,6 +9,7 @@ Start: python3 app.py  ->  open http://127.0.0.1:5005
 """
 
 import io
+import os
 import time
 import re
 from typing import Optional
@@ -18,6 +19,22 @@ from flask import Flask, render_template, request, jsonify, send_file, abort
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
+
+
+def _load_dotenv(path: str = ".env") -> None:
+    """Mini-loader voor .env (alleen lokaal; op Render zet je env vars in dashboard)."""
+    if not os.path.exists(path):
+        return
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+
+_load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 app = Flask(__name__)
 
@@ -30,6 +47,9 @@ WOZ_HEADERS = {
     "Referer": "https://www.wozwaardeloket.nl/",
     "User-Agent": "Mozilla/5.0 (WOZ-tool lokaal)",
 }
+
+EPO_API = "https://public.ep-online.nl/api/v5/PandEnergielabel/AdresseerbaarObject/{}"
+EPO_API_KEY = os.environ.get("EPONLINE_API_KEY", "").strip()
 
 REQUEST_TIMEOUT = 15
 session = requests.Session()
@@ -66,25 +86,70 @@ def haal_woz(nummeraanduiding_id: str) -> Optional[dict]:
         return None
 
 
+def haal_energielabel(adresseerbaar_object_id: str) -> Optional[dict]:
+    """Haalt het meest recente energielabel op via EP-online.
+
+    Returnt dict met velden energieklasse, registratiedatum, geldig_tot,
+    bouwjaar, gebouwtype — of None als er geen label is.
+    """
+    if not EPO_API_KEY:
+        return None
+    try:
+        r = session.get(
+            EPO_API.format(adresseerbaar_object_id),
+            headers={"Authorization": EPO_API_KEY, "Accept": "application/json"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            return None
+        # Meest recente label (hoogste registratiedatum)
+        labels = sorted(
+            data,
+            key=lambda x: x.get("Registratiedatum") or "",
+            reverse=True,
+        )
+        latest = labels[0]
+        return {
+            "energieklasse": latest.get("Energieklasse"),
+            "registratiedatum": (latest.get("Registratiedatum") or "")[:10],
+            "geldig_tot": (latest.get("Geldig_tot") or "")[:10],
+            "bouwjaar": latest.get("Bouwjaar"),
+            "gebouwtype": latest.get("Gebouwtype"),
+            "gebouwklasse": latest.get("Gebouwklasse"),
+            "berekend_energieverbruik": latest.get("BerekendeEnergieverbruik"),
+        }
+    except requests.RequestException:
+        return None
+
+
 def maak_resultaat(adres: str) -> dict:
-    """Combineert adres-resolve + WOZ-call tot één resultaat-dict."""
+    """Combineert adres-resolve + WOZ-call + energielabel tot één resultaat-dict."""
     hit = zoek_adres(adres)
     if not hit:
         return {"adres_invoer": adres, "status": "Adres niet gevonden", "wozWaarden": []}
 
     weergavenaam = hit.get("weergavenaam", "")
     nummeraanduiding = hit.get("nummeraanduiding_id")
+    adresseerbaar_object_id = hit.get("adresseerbaarobject_id")
     if not nummeraanduiding:
         return {"adres_invoer": adres, "status": "Geen nummeraanduiding", "wozWaarden": []}
 
     woz = haal_woz(nummeraanduiding)
+    energielabel = haal_energielabel(adresseerbaar_object_id) if adresseerbaar_object_id else None
+
     if not woz:
         return {
             "adres_invoer": adres,
             "weergavenaam": weergavenaam,
             "nummeraanduiding": nummeraanduiding,
+            "adresseerbaarobject_id": adresseerbaar_object_id,
             "status": "Geen WOZ-waarde bekend (niet-woning of onbekend)",
             "wozWaarden": [],
+            "energielabel": energielabel,
         }
 
     obj = woz.get("wozObject", {}) or {}
@@ -94,6 +159,7 @@ def maak_resultaat(adres: str) -> dict:
         "adres_invoer": adres,
         "weergavenaam": weergavenaam,
         "nummeraanduiding": nummeraanduiding,
+        "adresseerbaarobject_id": adresseerbaar_object_id,
         "status": "OK",
         "wozobjectnummer": obj.get("wozobjectnummer"),
         "straat": obj.get("openbareruimtenaam"),
@@ -111,6 +177,7 @@ def maak_resultaat(adres: str) -> dict:
             key=lambda x: x["peildatum"] or "",
             reverse=True,
         ),
+        "energielabel": energielabel,
     }
 
 
@@ -228,6 +295,10 @@ def api_excel():
         "wozobjectnummer",
         "grondoppervlakte",
         "nummeraanduiding",
+        "energielabel",
+        "bouwjaar",
+        "gebouwtype",
+        "label geldig tot",
     ]
     out_header = out_header_base + [f"WOZ {p}" for p in peildata_sorted]
     ws.append(out_header)
@@ -243,6 +314,7 @@ def api_excel():
     ws.freeze_panes = "A2"
 
     for row, res in zip(rows[1:], resultaten):
+        ep = res.get("energielabel") or {}
         out_row = list(row) + [
             res.get("status"),
             res.get("weergavenaam"),
@@ -251,6 +323,10 @@ def api_excel():
             res.get("wozobjectnummer"),
             res.get("grondoppervlakte"),
             res.get("nummeraanduiding"),
+            ep.get("energieklasse"),
+            ep.get("bouwjaar"),
+            ep.get("gebouwtype"),
+            ep.get("geldig_tot"),
         ]
         waarden_map = {w["peildatum"]: w["vastgesteldeWaarde"] for w in res.get("wozWaarden", [])}
         for p in peildata_sorted:
