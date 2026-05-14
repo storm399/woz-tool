@@ -139,7 +139,12 @@ def haal_objecten(
     params = {"aantal": aantal, "vanaf": vanaf, "actief": "true"}
     if status:
         params["status"] = status
-    headers = {"Authorization": _token(), "Accept": "application/json"}
+
+    # Realworks vereist Authorization-header in formaat: "rwauth <token>".
+    # Gebruiker mag de token mét of zonder prefix in REALWORKS_TOKEN zetten.
+    raw_token = _token()
+    auth_value = raw_token if raw_token.lower().startswith("rwauth ") else f"rwauth {raw_token}"
+    headers = {"Authorization": auth_value, "Accept": "application/json"}
 
     try:
         r = requests.get(url, params=params, headers=headers, timeout=TIMEOUT)
