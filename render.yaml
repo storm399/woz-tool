@@ -10,3 +10,7 @@ services:
         value: 3.12.3
       - key: EPONLINE_API_KEY
         sync: false  # waarde in Render-dashboard ingesteld; nooit committen
+      - key: REALWORKS_TOKEN
+        sync: false  # vul in dashboard in zodra je de koppeling activeert
+      - key: REALWORKS_AFDELINGSCODE
+        sync: false

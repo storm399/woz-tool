@@ -16,6 +16,8 @@ from typing import Optional
 
 import requests
 from flask import Flask, render_template, request, jsonify, send_file, abort
+
+import realworks_service
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -950,6 +952,69 @@ def api_template():
         download_name="woz_template.xlsx",
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+
+# ---------------------------------------------------------------------------
+# Realworks-koppeling
+# ---------------------------------------------------------------------------
+
+
+@app.route("/realworks")
+def realworks_page():
+    """HTML-pagina met overzicht van Realworks-objecten."""
+    return render_template(
+        "realworks.html",
+        geconfigureerd=realworks_service.is_geconfigureerd(),
+    )
+
+
+@app.route("/api/realworks")
+def api_realworks():
+    """JSON-endpoint: één pagina Realworks-objecten."""
+    try:
+        vanaf = int(request.args.get("vanaf", 0))
+        aantal = int(request.args.get("aantal", 100))
+    except ValueError:
+        return jsonify({"error": "Parameter 'vanaf' en 'aantal' moeten getallen zijn."}), 400
+    status = (request.args.get("status") or "").strip() or None
+
+    try:
+        page = realworks_service.haal_objecten(vanaf=vanaf, aantal=aantal, status=status)
+    except realworks_service.RealworksError as e:
+        return jsonify({"error": str(e)}), e.status_code or 502
+    return jsonify(page)
+
+
+@app.route("/api/realworks/alle")
+def api_realworks_alle():
+    """JSON-endpoint: alle objecten via auto-paginatie (gecapt)."""
+    status = (request.args.get("status") or "").strip() or None
+    try:
+        max_obj = int(request.args.get("max", 500))
+    except ValueError:
+        max_obj = 500
+    try:
+        result = realworks_service.haal_alle_objecten(status=status, max_objecten=max_obj)
+    except realworks_service.RealworksError as e:
+        return jsonify({"error": str(e)}), e.status_code or 502
+    return jsonify(result)
+
+
+@app.route("/api/realworks/verrijk", methods=["POST"])
+def api_realworks_verrijk():
+    """Neemt een lijst Realworks-objecten en draait WOZ/BAG/label/CBS/monument."""
+    payload = request.get_json(silent=True) or {}
+    objecten = payload.get("objecten") or []
+    if not objecten:
+        return jsonify({"error": "Geen objecten meegegeven."}), 400
+
+    verrijkt = []
+    for obj in objecten:
+        adres = realworks_service.adres_string(obj)
+        res = maak_resultaat(adres) if adres else {"adres_invoer": "", "status": "Leeg"}
+        verrijkt.append({"realworks": obj, "resultaat": res})
+        time.sleep(0.15)
+    return jsonify({"verrijkt": verrijkt, "aantal": len(verrijkt)})
 
 
 if __name__ == "__main__":

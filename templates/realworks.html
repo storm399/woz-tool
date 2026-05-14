@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <title>Realworks-objecten · WOZ-tool</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      --primary: #1F4E79;
+      --primary-dark: #143452;
+      --accent: #E30613;
+      --bg: #f4f6f8;
+      --card: #ffffff;
+      --border: #d8dde3;
+      --text: #1f2933;
+      --muted: #6b7785;
+      --success: #1f7a3a;
+      --warn: #b35a00;
+      --danger: #b00020;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.45;
+    }
+    header {
+      background: var(--primary);
+      color: #fff;
+      padding: 18px 32px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      box-shadow: 0 2px 4px rgba(0,0,0,.08);
+    }
+    header h1 { font-size: 20px; margin: 0; font-weight: 600; }
+    header .subtitle { font-size: 13px; opacity: .85; }
+    header nav a {
+      color: #fff;
+      text-decoration: none;
+      margin-left: 16px;
+      font-size: 13px;
+      opacity: .8;
+    }
+    header nav a:hover { opacity: 1; text-decoration: underline; }
+    header nav a.active { opacity: 1; font-weight: 600; }
+
+    main { max-width: 1500px; margin: 24px auto; padding: 0 20px 80px; }
+
+    .toolbar {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px 18px;
+      margin-bottom: 16px;
+    }
+    .toolbar label { font-size: 13px; color: var(--muted); }
+    .toolbar select, .toolbar input {
+      padding: 7px 10px;
+      font-size: 13px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: #fff;
+      font-family: inherit;
+    }
+    button {
+      background: var(--primary);
+      color: #fff;
+      border: none;
+      padding: 8px 14px;
+      font-size: 13px;
+      font-weight: 600;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    button:hover:not(:disabled) { background: var(--primary-dark); }
+    button:disabled { background: #9aa5b1; cursor: not-allowed; }
+    button.secondary {
+      background: transparent;
+      color: var(--primary);
+      border: 1px solid var(--primary);
+    }
+    button.secondary:hover:not(:disabled) { background: rgba(31,78,121,.08); }
+
+    .status-bar {
+      font-size: 13px;
+      color: var(--muted);
+      min-height: 18px;
+      margin: 8px 4px 12px;
+    }
+    .status-bar.err { color: var(--danger); }
+    .status-bar.ok { color: var(--success); }
+    .status-bar.warn { color: var(--warn); }
+
+    .config-warning {
+      background: #fff4e5;
+      border: 1px solid #f5c889;
+      border-radius: 8px;
+      padding: 16px 20px;
+      margin-bottom: 16px;
+      font-size: 13px;
+    }
+    .config-warning strong { color: #8a5a00; }
+    .config-warning code {
+      background: rgba(0,0,0,.06);
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-size: 12px;
+    }
+
+    .grid {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    thead { background: #eef3f9; position: sticky; top: 0; z-index: 1; }
+    th {
+      text-align: left;
+      padding: 10px 8px;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .4px;
+      color: var(--primary-dark);
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    td {
+      padding: 10px 8px;
+      border-bottom: 1px solid #eef0f3;
+      vertical-align: top;
+    }
+    tbody tr:hover { background: #fafbfc; }
+    .thumb {
+      width: 64px;
+      height: 48px;
+      object-fit: cover;
+      border-radius: 4px;
+      background: #eef0f3;
+      display: block;
+    }
+    .num { text-align: right; font-variant-numeric: tabular-nums; }
+    .pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: 600;
+      background: #eef3f9;
+      color: var(--primary-dark);
+      text-transform: capitalize;
+    }
+    .pill.beschikbaar { background: #DEF7E5; color: #1f7a3a; }
+    .pill.verkocht, .pill.transactie { background: #FEEAEC; color: #b00020; }
+    .pill.optie { background: #FFF4D6; color: #8a5a00; }
+    .empty {
+      padding: 40px 20px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .spinner {
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      border: 2px solid #c8d2dd;
+      border-top-color: var(--primary);
+      border-radius: 50%;
+      animation: spin .8s linear infinite;
+      vertical-align: middle;
+      margin-right: 6px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    footer {
+      text-align: center;
+      color: var(--muted);
+      font-size: 12px;
+      padding: 18px 0 28px;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Realworks-objecten</h1>
+    <div class="subtitle">Aankoop v3 koppeling · /aankoop/v3/objecten/{afdelingscode}</div>
+  </div>
+  <nav>
+    <a href="/">WOZ-tool</a>
+    <a href="/realworks" class="active">Realworks</a>
+  </nav>
+</header>
+
+<main>
+
+  {% if not geconfigureerd %}
+  <div class="config-warning">
+    <strong>Realworks-credentials nog niet ingesteld.</strong><br>
+    Zet de volgende environment variables (lokaal in <code>.env</code>, op Render in het dashboard):
+    <code>REALWORKS_TOKEN</code> en <code>REALWORKS_AFDELINGSCODE</code>.
+    Daarna werkt deze pagina automatisch.
+  </div>
+  {% endif %}
+
+  <div class="toolbar">
+    <label>Status</label>
+    <select id="status">
+      <option value="">— alle —</option>
+      <option value="BESCHIKBAAR">Beschikbaar</option>
+      <option value="ONDER_BOD">Onder bod</option>
+      <option value="ONDER_OPTIE">Onder optie</option>
+      <option value="VERKOCHT_ONDER_VOORBEHOUD">Verkocht onder voorbehoud</option>
+      <option value="VERKOCHT">Verkocht</option>
+      <option value="INGETROKKEN">Ingetrokken</option>
+    </select>
+
+    <label>Aantal</label>
+    <select id="aantal">
+      <option value="25">25</option>
+      <option value="50">50</option>
+      <option value="100" selected>100</option>
+    </select>
+
+    <button id="laad">Laad objecten</button>
+    <button id="laadAlle" class="secondary">Alle pagina's</button>
+    <button id="export" class="secondary" disabled>Exporteer naar Excel</button>
+    <span style="flex:1"></span>
+    <span id="paginatie" style="font-size:12px;color:var(--muted)"></span>
+  </div>
+
+  <div class="status-bar" id="status-bar"></div>
+
+  <div class="grid">
+    <table>
+      <thead>
+        <tr>
+          <th>Foto</th>
+          <th>Adres</th>
+          <th>Postcode</th>
+          <th>Plaats</th>
+          <th>Status</th>
+          <th>Bouwjaar</th>
+          <th>Type</th>
+          <th>Kamers</th>
+          <th class="num">m²</th>
+          <th class="num">Vraagprijs</th>
+          <th class="num">Transactieprijs</th>
+          <th>Transport</th>
+          <th>SystemID</th>
+        </tr>
+      </thead>
+      <tbody id="rows">
+        <tr><td colspan="13" class="empty">Druk op “Laad objecten” om te starten.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</main>
+
+<footer>
+  Bron: Realworks Aankoop v3 · velden gefilterd op verzoek.
+</footer>
+
+<script>
+const $ = sel => document.querySelector(sel);
+const fmtEur = n => (n == null || n === '') ? '—' : new Intl.NumberFormat('nl-NL',{style:'currency',currency:'EUR',maximumFractionDigits:0}).format(n);
+const fmtDate = s => {
+  if (!s) return '—';
+  // ISO date of jjjj-mm-dd
+  const d = String(s).slice(0,10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return s;
+  const [y,m,dd] = d.split('-');
+  return `${dd}-${m}-${y}`;
+};
+const escape = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+  '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+}[c]));
+
+let huidige = [];  // huidige objecten in tabel
+let vanaf = 0;
+let aantal = 100;
+
+function pillForStatus(status) {
+  if (!status) return '<span class="pill">—</span>';
+  const lc = String(status).toLowerCase();
+  let cls = '';
+  if (lc.includes('beschikbaar')) cls = 'beschikbaar';
+  else if (lc.includes('verkocht') || lc.includes('transport')) cls = 'verkocht';
+  else if (lc.includes('optie') || lc.includes('bod')) cls = 'optie';
+  return `<span class="pill ${cls}">${escape(status.replace(/_/g, ' ').toLowerCase())}</span>`;
+}
+
+function adresKort(o) {
+  const bits = [o.straat, o.huisnummer, o.huisnummerToevoeging];
+  return bits.filter(Boolean).join(' ');
+}
+
+function typeLabel(o) {
+  // soortObject + typeAppartement of woningType
+  const onderdelen = [o.soortObject, o.typeAppartement, o.woningType].filter(Boolean);
+  return [...new Set(onderdelen)].join(' · ') || '—';
+}
+
+function renderRows(objecten) {
+  if (!objecten.length) {
+    $('#rows').innerHTML = '<tr><td colspan="13" class="empty">Geen objecten gevonden voor deze filter.</td></tr>';
+    return;
+  }
+  $('#rows').innerHTML = objecten.map(o => `
+    <tr>
+      <td>${o.media_url ? `<img class="thumb" loading="lazy" src="${escape(o.media_url)}" alt="">` : '<div class="thumb"></div>'}</td>
+      <td><strong>${escape(adresKort(o))}</strong></td>
+      <td>${escape(o.postcode || '—')}</td>
+      <td>${escape(o.plaatsnaam || '—')}</td>
+      <td>${pillForStatus(o.status)}</td>
+      <td>${escape(o.bouwjaar || '—')}</td>
+      <td>${escape(typeLabel(o))}</td>
+      <td>${escape(o.aantalKamers || '—')}</td>
+      <td class="num">${o.woonoppervlakte != null ? o.woonoppervlakte : '—'}</td>
+      <td class="num">${fmtEur(o.vraagprijs)}</td>
+      <td class="num">${fmtEur(o.transactieprijs)}</td>
+      <td>${fmtDate(o.datumTransport)}</td>
+      <td style="font-family:ui-monospace,monospace;font-size:11px;color:var(--muted)">${escape(o.systemid || '—')}</td>
+    </tr>
+  `).join('');
+}
+
+function zetStatus(msg, kind) {
+  const el = $('#status-bar');
+  el.className = 'status-bar' + (kind ? ' ' + kind : '');
+  el.innerHTML = msg;
+}
+
+async function laadPagina(reset = true) {
+  if (reset) vanaf = 0;
+  aantal = +$('#aantal').value;
+  const status = $('#status').value;
+  zetStatus('<span class="spinner"></span>Laden…');
+  $('#laad').disabled = true;
+  $('#laadAlle').disabled = true;
+  try {
+    const params = new URLSearchParams({ vanaf, aantal });
+    if (status) params.set('status', status);
+    const r = await fetch('/api/realworks?' + params);
+    const data = await r.json();
+    if (!r.ok || data.error) throw new Error(data.error || ('HTTP ' + r.status));
+    huidige = data.objecten || [];
+    renderRows(huidige);
+    const totaalTxt = data.totaal_in_api != null ? ` · API meldt ${data.totaal_in_api} totaal` : '';
+    $('#paginatie').textContent = `Toont ${vanaf+1}–${vanaf + data.ontvangen}${totaalTxt}`;
+    zetStatus(`${data.ontvangen} objecten geladen.`, 'ok');
+    $('#export').disabled = huidige.length === 0;
+  } catch (e) {
+    zetStatus('Fout: ' + e.message, 'err');
+    $('#rows').innerHTML = '<tr><td colspan="13" class="empty">Geen data — zie foutmelding hierboven.</td></tr>';
+  } finally {
+    $('#laad').disabled = false;
+    $('#laadAlle').disabled = false;
+  }
+}
+
+async function laadAllePaginas() {
+  const status = $('#status').value;
+  zetStatus('<span class="spinner"></span>Doorloop alle pagina\'s…');
+  $('#laad').disabled = true;
+  $('#laadAlle').disabled = true;
+  try {
+    const params = new URLSearchParams();
+    if (status) params.set('status', status);
+    const r = await fetch('/api/realworks/alle?' + params);
+    const data = await r.json();
+    if (!r.ok || data.error) throw new Error(data.error || ('HTTP ' + r.status));
+    huidige = data.objecten || [];
+    renderRows(huidige);
+    $('#paginatie').textContent = `${data.totaal} objecten geladen` + (data.afgebroken ? ' (cap bereikt)' : '');
+    zetStatus(`${data.totaal} objecten via paginatie opgehaald.`, 'ok');
+    $('#export').disabled = huidige.length === 0;
+  } catch (e) {
+    zetStatus('Fout: ' + e.message, 'err');
+  } finally {
+    $('#laad').disabled = false;
+    $('#laadAlle').disabled = false;
+  }
+}
+
+$('#laad').addEventListener('click', () => laadPagina(true));
+$('#laadAlle').addEventListener('click', laadAllePaginas);
+$('#export').addEventListener('click', () => {
+  zetStatus('Excel-export volgt nog — placeholder.', 'warn');
+});
+
+// Auto-laad als de pagina opent én er credentials zijn (geen warning gerenderd)
+{% if geconfigureerd %}
+window.addEventListener('DOMContentLoaded', () => laadPagina(true));
+{% endif %}
+</script>
+</body>
+</html>
