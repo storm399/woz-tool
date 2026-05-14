@@ -53,9 +53,101 @@ EPO_API = "https://public.ep-online.nl/api/v5/PandEnergielabel/AdresseerbaarObje
 EPO_API_KEY = os.environ.get("EPONLINE_API_KEY", "").strip()
 
 BAG_WFS = "https://service.pdok.nl/lv/bag/wfs/v2_0"
+CBS_WFS = "https://service.pdok.nl/cbs/wijkenbuurten/2023/wfs/v1_0"
+RCE_SPARQL = "https://api.linkeddata.cultureelerfgoed.nl/datasets/rce/cho/sparql"
 
 REQUEST_TIMEOUT = 15
 session = requests.Session()
+
+
+def _normaliseer(s: str) -> str:
+    """Normaliseert adres-string voor match-vergelijking."""
+    if not s:
+        return ""
+    s = s.lower()
+    s = re.sub(r"[^\w\s]", " ", s, flags=re.UNICODE)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _check_adres_match(invoer: str, gevonden_straat: str, gevonden_huisnummer) -> tuple:
+    """Returnt (match: bool, reden: str).
+
+    Match = True als de gevonden straatnaam (genormaliseerd) als substring
+    in de invoer voorkomt EN het gevonden huisnummer in de invoer staat.
+    """
+    inv = _normaliseer(invoer)
+    if not inv:
+        return False, "Adres leeg"
+
+    straat_norm = _normaliseer(gevonden_straat or "")
+    nr = str(gevonden_huisnummer) if gevonden_huisnummer is not None else ""
+
+    straat_ok = bool(straat_norm) and straat_norm in inv
+    if not straat_ok:
+        return False, f"Straat ‘{gevonden_straat}’ niet in invoer"
+
+    if nr:
+        invoer_nums = re.findall(r"\d+", inv)
+        if nr not in invoer_nums:
+            return False, f"Huisnummer {nr} niet in invoer"
+
+    return True, "OK"
+
+
+def _bereken_afgeleiden(res: dict) -> None:
+    """Vult res in-place met afgeleide velden: WOZ/m², %-stijging, match-flag."""
+    waarden = res.get("wozWaarden") or []
+    bag = res.get("bag") or {}
+    opp = bag.get("gebruiksoppervlakte")
+    laatste = waarden[0]["vastgesteldeWaarde"] if waarden and waarden[0].get("vastgesteldeWaarde") else None
+
+    res["woz_per_m2"] = int(round(laatste / opp)) if (laatste and opp) else None
+
+    # Stijgingspercentages
+    if len(waarden) >= 2 and waarden[0].get("vastgesteldeWaarde") and waarden[1].get("vastgesteldeWaarde"):
+        cur = waarden[0]["vastgesteldeWaarde"]
+        prev = waarden[1]["vastgesteldeWaarde"]
+        res["pct_1jr"] = round((cur - prev) / prev * 100, 1)
+    else:
+        res["pct_1jr"] = None
+
+    def vergelijk_x_jaar_geleden(jaren):
+        if not waarden or not laatste:
+            return None
+        peildatum_doel = None
+        from datetime import datetime
+        try:
+            cur_year = int(waarden[0]["peildatum"][:4])
+        except (KeyError, ValueError, TypeError):
+            return None
+        doel_year = cur_year - jaren
+        for w in waarden:
+            if w.get("peildatum", "").startswith(str(doel_year)):
+                doel = w.get("vastgesteldeWaarde")
+                if doel:
+                    return round((laatste - doel) / doel * 100, 1)
+        # Anders: pak oudst beschikbaar
+        oudste = waarden[-1].get("vastgesteldeWaarde") if waarden else None
+        return round((laatste - oudste) / oudste * 100, 1) if oudste else None
+
+    res["pct_5jr"] = vergelijk_x_jaar_geleden(5)
+
+    # Vergelijking met oudst beschikbaar (vaak 2014)
+    if waarden and waarden[-1].get("vastgesteldeWaarde") and laatste:
+        oudste = waarden[-1]["vastgesteldeWaarde"]
+        res["pct_sinds_oudst"] = round((laatste - oudste) / oudste * 100, 1)
+        res["oudste_peiljaar"] = (waarden[-1].get("peildatum") or "")[:4]
+    else:
+        res["pct_sinds_oudst"] = None
+        res["oudste_peiljaar"] = None
+
+    # Adres-match-check: gebruik losse straat+huisnummer ipv hele weergavenaam
+    bag_straat = res.get("straat") or (res.get("bag") or {}).get("straat")
+    bag_nr = res.get("huisnummer")
+    match, reden = _check_adres_match(res.get("adres_invoer", ""), bag_straat, bag_nr)
+    res["adres_match"] = match
+    res["adres_match_reden"] = reden
 
 
 def zoek_adres(query: str) -> Optional[dict]:
@@ -129,6 +221,103 @@ def haal_bag(adresseerbaar_object_id: str) -> Optional[dict]:
             "vbo_status": p.get("status"),
             "pand_id": p.get("pandidentificatie"),
             "pand_status": p.get("pandstatus"),
+            "straat": p.get("openbare_ruimte"),
+            "huisnummer": p.get("huisnummer"),
+        }
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def haal_cbs_buurt(buurtcode: str) -> Optional[dict]:
+    """Haalt CBS-kerncijfers voor een buurt op via PDOK Wijken-en-Buurten WFS.
+
+    Verwacht buurtcode in formaat 'BU05990112'. Eenheden:
+    - gemiddeldeWoningwaarde: in duizenden euro's (we vermenigvuldigen ×1000)
+    - gemiddeldInkomenPerInkomensontvanger: idem ×1000
+    """
+    if not buurtcode:
+        return None
+    fil = (
+        f"<Filter><PropertyIsEqualTo>"
+        f"<PropertyName>buurtcode</PropertyName>"
+        f"<Literal>{buurtcode}</Literal>"
+        f"</PropertyIsEqualTo></Filter>"
+    )
+    try:
+        r = session.get(
+            CBS_WFS,
+            params={
+                "service": "WFS",
+                "version": "2.0.0",
+                "request": "GetFeature",
+                "typeNames": "wijkenbuurten:buurten",
+                "outputFormat": "application/json",
+                "srsName": "EPSG:4326",
+                "filter": fil,
+                "count": 1,
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+        r.raise_for_status()
+        feats = r.json().get("features", [])
+        if not feats:
+            return None
+        p = feats[0].get("properties", {}) or {}
+
+        def _g(key, mult=1):
+            v = p.get(key)
+            if v is None or (isinstance(v, (int, float)) and v <= -99000):
+                return None
+            return v * mult if isinstance(v, (int, float)) else v
+
+        return {
+            "buurtnaam": _g("buurtnaam"),
+            "gemeentenaam": _g("gemeentenaam"),
+            "aantal_inwoners": _g("aantalInwoners"),
+            "bevolkingsdichtheid": _g("bevolkingsdichtheidInwonersPerKm2"),
+            "gem_woningwaarde": _g("gemiddeldeWoningwaarde", 1000),
+            "gem_inkomen": _g("gemiddeldInkomenPerInkomensontvanger", 1000),
+            "pct_huur": _g("percentageHuurwoningen"),
+            "pct_koop": _g("percentageKoopwoningen"),
+            "huishoudgrootte": _g("gemiddeldeHuishoudsgrootte"),
+            "woningvoorraad": _g("woningvoorraad"),
+        }
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def haal_monument(pand_id: str) -> Optional[dict]:
+    """Checkt of een BAG-pand een rijksmonument is via RCE Linked Data SPARQL.
+
+    Returnt dict met monumentnummer + adres uit RCE, of None.
+    """
+    if not pand_id:
+        return None
+    query = (
+        "PREFIX ceo: <https://linkeddata.cultureelerfgoed.nl/def/ceo#>\n"
+        "SELECT ?nummer ?straat ?huisnr WHERE {\n"
+        "  ?monument a ceo:Rijksmonument ;\n"
+        "            ceo:rijksmonumentnummer ?nummer ;\n"
+        "            ceo:heeftBasisregistratieRelatie/ceo:heeftBAGRelatie ?bagrel .\n"
+        f"  ?bagrel ceo:pandIdentificatie \"{pand_id}\" .\n"
+        "  OPTIONAL { ?bagrel ceo:openbareRuimte ?straat ; ceo:huisnummer ?huisnr }\n"
+        "} LIMIT 1"
+    )
+    try:
+        r = session.get(
+            RCE_SPARQL,
+            params={"query": query, "format": "json"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        r.raise_for_status()
+        rows = r.json()
+        if not rows:
+            return None
+        row = rows[0]
+        return {
+            "monumentnummer": row.get("nummer"),
+            "monument_straat": row.get("straat"),
+            "monument_huisnummer": row.get("huisnr"),
         }
     except (requests.RequestException, ValueError):
         return None
@@ -186,30 +375,44 @@ def maak_resultaat(adres: str) -> dict:
     if not nummeraanduiding:
         return {"adres_invoer": adres, "status": "Geen nummeraanduiding", "wozWaarden": []}
 
+    buurtcode = hit.get("buurtcode")
+    buurtnaam = hit.get("buurtnaam")
+    woonplaatsnaam_pdok = hit.get("woonplaatsnaam")
+
     woz = haal_woz(nummeraanduiding)
     bag = haal_bag(adresseerbaar_object_id) if adresseerbaar_object_id else None
     energielabel = haal_energielabel(adresseerbaar_object_id) if adresseerbaar_object_id else None
+    cbs = haal_cbs_buurt(buurtcode) if buurtcode else None
+    monument = haal_monument(bag.get("pand_id") if bag else None)
 
     if not woz:
-        return {
+        res_geen = {
             "adres_invoer": adres,
             "weergavenaam": weergavenaam,
             "nummeraanduiding": nummeraanduiding,
             "adresseerbaarobject_id": adresseerbaar_object_id,
+            "buurtnaam": buurtnaam,
+            "buurtcode": buurtcode,
+            "cbs": cbs,
+            "monument": monument,
             "status": "Geen WOZ-waarde bekend (niet-woning of onbekend)",
             "wozWaarden": [],
             "bag": bag,
             "energielabel": energielabel,
         }
+        _bereken_afgeleiden(res_geen)
+        return res_geen
 
     obj = woz.get("wozObject", {}) or {}
     waarden = woz.get("wozWaarden", []) or []
 
-    return {
+    res = {
         "adres_invoer": adres,
         "weergavenaam": weergavenaam,
         "nummeraanduiding": nummeraanduiding,
         "adresseerbaarobject_id": adresseerbaar_object_id,
+        "buurtnaam": buurtnaam,
+        "buurtcode": buurtcode,
         "status": "OK",
         "wozobjectnummer": obj.get("wozobjectnummer"),
         "straat": obj.get("openbareruimtenaam"),
@@ -229,7 +432,11 @@ def maak_resultaat(adres: str) -> dict:
         ),
         "bag": bag,
         "energielabel": energielabel,
+        "cbs": cbs,
+        "monument": monument,
     }
+    _bereken_afgeleiden(res)
+    return res
 
 
 @app.route("/")
@@ -368,24 +575,34 @@ def _bouw_excel(header_in, rows, resultaten, peildata_sorted) -> Workbook:
     ws = wb.active
     ws.title = "Resultaten"
 
-    invoer_kols = list(header_in) or ["adres"]
-    locatie_kols = ["status", "gevonden adres", "postcode", "woonplaats", "BAG-id"]
-    bag_kols = ["bouwjaar", "gebr.oppervlakte (m²)", "gebruiksdoel"]
-    label_kols = ["energielabel", "gebouwtype", "geldig t/m"]
-    woz_kols = [p[:4] for p in peildata_sorted]  # alleen jaartal
+    oudste_peiljaar = peildata_sorted[-1][:4] if peildata_sorted else "oudste"
 
-    n_in = len(invoer_kols)
-    n_loc = len(locatie_kols)
-    n_bag = len(bag_kols)
-    n_lab = len(label_kols)
-    n_woz = len(woz_kols)
+    invoer_kols = list(header_in) or ["adres"]
+    locatie_kols = ["status", "match", "gevonden adres", "postcode", "woonplaats", "BAG-id"]
+    bag_kols = ["bouwjaar", "opp. (m²)", "gebruiksdoel"]
+    buurt_kols = ["buurt", "gem. WOZ buurt", "gem. inkomen", "% huur"]
+    label_kols = ["energielabel", "gebouwtype", "geldig t/m"]
+    mon_kols = ["rijksmonument"]
+    afgeleid_kols = ["€/m²", "% 1jr", "% 5jr", f"% sinds {oudste_peiljaar}"]
+    woz_kols = [p[:4] for p in peildata_sorted]
+
+    sizes = {
+        "in": len(invoer_kols), "loc": len(locatie_kols), "bag": len(bag_kols),
+        "buurt": len(buurt_kols), "lab": len(label_kols), "mon": len(mon_kols),
+        "afg": len(afgeleid_kols), "woz": len(woz_kols),
+    }
 
     # Rij 1: groepheaders (merged)
-    groepen = [("Invoer", n_in, "6B7785"),
-               ("Adres & WOZ-object", n_loc, _RED_DARK),
-               ("BAG-gegevens", n_bag, "8B5A2B"),
-               ("Energielabel (EP-online)", n_lab, "1B7A3A"),
-               ("WOZ-waarden", n_woz, _RED_MID)]
+    groepen = [
+        ("Invoer", sizes["in"], "6B7785"),
+        ("Adres & WOZ-object", sizes["loc"], _RED_DARK),
+        ("BAG-gegevens", sizes["bag"], "8B5A2B"),
+        ("Buurt (CBS 2023)", sizes["buurt"], "0F766E"),
+        ("Energielabel (EP-online)", sizes["lab"], "1B7A3A"),
+        ("Monument (RCE)", sizes["mon"], "7C3AED"),
+        ("Trend", sizes["afg"], "B45309"),
+        ("WOZ-waarden", sizes["woz"], _RED_MID),
+    ]
     col = 1
     for naam, n, kleur in groepen:
         if n == 0:
@@ -402,7 +619,8 @@ def _bouw_excel(header_in, rows, resultaten, peildata_sorted) -> Workbook:
     ws.row_dimensions[1].height = 24
 
     # Rij 2: kolomheaders
-    headers_row2 = invoer_kols + locatie_kols + bag_kols + label_kols + woz_kols
+    headers_row2 = (invoer_kols + locatie_kols + bag_kols + buurt_kols
+                    + label_kols + mon_kols + afgeleid_kols + woz_kols)
     for i, h in enumerate(headers_row2, start=1):
         c = ws.cell(row=2, column=i, value=h)
         c.font = Font(bold=True, color="1F2933", size=10)
@@ -412,35 +630,53 @@ def _bouw_excel(header_in, rows, resultaten, peildata_sorted) -> Workbook:
     ws.row_dimensions[2].height = 30
 
     # Data
+    mismatched_rows = []
     for row, res in zip(rows[1:], resultaten):
         bag = res.get("bag") or {}
         ep = res.get("energielabel") or {}
+        cbs = res.get("cbs") or {}
+        mon = res.get("monument") or {}
         out_row = list(row)
-        # Pad indien rij korter dan header
-        out_row += [None] * (n_in - len(out_row))
-        out_row = out_row[:n_in]
+        out_row += [None] * (sizes["in"] - len(out_row))
+        out_row = out_row[:sizes["in"]]
+
+        match_ok = res.get("adres_match")
+        match_cell = "OK" if match_ok else (res.get("adres_match_reden") or "—")
+
         out_row += [
             res.get("status"),
+            match_cell,
             res.get("weergavenaam"),
             res.get("postcode"),
             res.get("woonplaats"),
             res.get("adresseerbaarobject_id") or res.get("nummeraanduiding"),
-            bag.get("bouwjaar"),
-            bag.get("gebruiksoppervlakte"),
-            bag.get("gebruiksdoel"),
-            ep.get("energieklasse"),
-            ep.get("gebouwtype"),
-            ep.get("geldig_tot"),
+        ]
+        out_row += [bag.get("bouwjaar"), bag.get("gebruiksoppervlakte"), bag.get("gebruiksdoel")]
+        out_row += [
+            cbs.get("buurtnaam"),
+            cbs.get("gem_woningwaarde"),
+            cbs.get("gem_inkomen"),
+            cbs.get("pct_huur"),
+        ]
+        out_row += [ep.get("energieklasse"), ep.get("gebouwtype"), ep.get("geldig_tot")]
+        out_row += [mon.get("monumentnummer") or "—"]
+        out_row += [
+            res.get("woz_per_m2"),
+            res.get("pct_1jr"),
+            res.get("pct_5jr"),
+            res.get("pct_sinds_oudst"),
         ]
         waarden_map = {w["peildatum"]: w["vastgesteldeWaarde"] for w in res.get("wozWaarden", [])}
         for p in peildata_sorted:
             out_row.append(waarden_map.get(p))
         ws.append(out_row)
+        if match_ok is False:
+            mismatched_rows.append(ws.max_row)
 
     max_row = ws.max_row
     max_col = len(headers_row2)
 
-    # Borders op alle cellen
+    # Borders + zebra
     for r in range(3, max_row + 1):
         for c_idx in range(1, max_col + 1):
             cell = ws.cell(row=r, column=c_idx)
@@ -448,10 +684,21 @@ def _bouw_excel(header_in, rows, resultaten, peildata_sorted) -> Workbook:
             if r % 2 == 1:
                 cell.fill = PatternFill("solid", fgColor="FAFBFC")
 
-    # Kleur energielabel-cel (col na invoer+locatie+bag)
-    label_col_idx = n_in + n_loc + n_bag + 1  # 1-based
+    # Mismatch-rijen oranje
+    mismatch_fill = PatternFill("solid", fgColor="FFE8D6")
+    for r in mismatched_rows:
+        for c_idx in range(1, max_col + 1):
+            ws.cell(row=r, column=c_idx).fill = mismatch_fill
+        # Match-cel donkerder kleuren
+        match_col = sizes["in"] + 2
+        c = ws.cell(row=r, column=match_col)
+        c.fill = PatternFill("solid", fgColor="FF9800")
+        c.font = Font(bold=True, color="FFFFFF")
+
+    # Energielabel-cel kleuren
+    label_col = sizes["in"] + sizes["loc"] + sizes["bag"] + sizes["buurt"] + 1
     for r in range(3, max_row + 1):
-        cell = ws.cell(row=r, column=label_col_idx)
+        cell = ws.cell(row=r, column=label_col)
         lab = (cell.value or "").strip() if isinstance(cell.value, str) else ""
         if lab in _LABEL_FILL:
             cell.fill = PatternFill("solid", fgColor=_LABEL_FILL[lab])
@@ -459,9 +706,54 @@ def _bouw_excel(header_in, rows, resultaten, peildata_sorted) -> Workbook:
             cell.font = Font(bold=True, color="1F2933" if light else "FFFFFF", size=11)
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
+    # Monument-cel highlight als gevuld (niet —)
+    mon_col = sizes["in"] + sizes["loc"] + sizes["bag"] + sizes["buurt"] + sizes["lab"] + 1
+    for r in range(3, max_row + 1):
+        cell = ws.cell(row=r, column=mon_col)
+        if cell.value and cell.value != "—":
+            cell.fill = PatternFill("solid", fgColor="7C3AED")
+            cell.font = Font(bold=True, color="FFFFFF")
+        cell.alignment = Alignment(horizontal="center")
+
+    # BAG-bouwjaar + opp formattering
+    bouwjaar_col = sizes["in"] + sizes["loc"] + 1
+    opp_col = sizes["in"] + sizes["loc"] + 2
+    for r in range(3, max_row + 1):
+        ws.cell(row=r, column=bouwjaar_col).number_format = "0"
+        ws.cell(row=r, column=bouwjaar_col).alignment = Alignment(horizontal="center")
+        ws.cell(row=r, column=opp_col).number_format = "0"
+        ws.cell(row=r, column=opp_col).alignment = Alignment(horizontal="center")
+
+    # CBS-kolommen formattering
+    buurt_start = sizes["in"] + sizes["loc"] + sizes["bag"] + 1
+    # buurtnaam | gem WOZ | gem inkomen | % huur
+    for r in range(3, max_row + 1):
+        ws.cell(row=r, column=buurt_start + 1).number_format = '"€" #,##0'
+        ws.cell(row=r, column=buurt_start + 2).number_format = '"€" #,##0'
+        ws.cell(row=r, column=buurt_start + 3).number_format = "0\"%\""
+        ws.cell(row=r, column=buurt_start + 3).alignment = Alignment(horizontal="center")
+
+    # Afgeleide kolommen: €/m², %1jr, %5jr, %sinds
+    afg_start = sizes["in"] + sizes["loc"] + sizes["bag"] + sizes["buurt"] + sizes["lab"] + sizes["mon"] + 1
+    for r in range(3, max_row + 1):
+        ws.cell(row=r, column=afg_start).number_format = '"€" #,##0'
+        for off in (1, 2, 3):
+            c = ws.cell(row=r, column=afg_start + off)
+            c.number_format = "0.0\"%\""
+            c.alignment = Alignment(horizontal="right")
+    # Conditional formatting op %-kolommen: groen positief, rood negatief
+    for off in (1, 2, 3):
+        col_letter = get_column_letter(afg_start + off)
+        rng = f"{col_letter}3:{col_letter}{max_row}"
+        ws.conditional_formatting.add(rng, ColorScaleRule(
+            start_type="num", start_value=-20, start_color="E57373",
+            mid_type="num", mid_value=0, mid_color="FFFFFF",
+            end_type="num", end_value=50, end_color="81C784",
+        ))
+
     # Euro-format + ColorScale voor WOZ-kolommen
-    woz_start = n_in + n_loc + n_bag + n_lab + 1
-    woz_end = woz_start + n_woz - 1
+    woz_start = sizes["in"] + sizes["loc"] + sizes["bag"] + sizes["buurt"] + sizes["lab"] + sizes["mon"] + sizes["afg"] + 1
+    woz_end = woz_start + sizes["woz"] - 1
     for c_idx in range(woz_start, woz_end + 1):
         for r in range(3, max_row + 1):
             ws.cell(row=r, column=c_idx).number_format = '"€" #,##0'
@@ -473,34 +765,32 @@ def _bouw_excel(header_in, rows, resultaten, peildata_sorted) -> Workbook:
                 end_type="max", end_color="9BB8DC",
             ))
 
-    # BAG bouwjaar als getal zonder duizendtal, gebruiksoppervlakte centered
-    bouwjaar_col = n_in + n_loc + 1
-    oppervlakte_col = n_in + n_loc + 2
-    for r in range(3, max_row + 1):
-        ws.cell(row=r, column=bouwjaar_col).number_format = "0"
-        ws.cell(row=r, column=bouwjaar_col).alignment = Alignment(horizontal="center")
-        ws.cell(row=r, column=oppervlakte_col).number_format = "0"
-        ws.cell(row=r, column=oppervlakte_col).alignment = Alignment(horizontal="center")
-
-    # Kolombreedtes — zinvolle defaults
+    # Kolombreedtes
     def set_width(col_letter, w):
         ws.column_dimensions[col_letter].width = w
 
-    for i in range(1, n_in + 1):
+    for i in range(1, sizes["in"] + 1):
         set_width(get_column_letter(i), 38)
-    locatie_widths = [11, 38, 10, 18, 18]
-    for i, w in enumerate(locatie_widths):
-        set_width(get_column_letter(n_in + 1 + i), w)
-    bag_widths = [10, 12, 22]
+    loc_widths = [11, 8, 38, 10, 16, 18]
+    for i, w in enumerate(loc_widths):
+        set_width(get_column_letter(sizes["in"] + 1 + i), w)
+    bag_widths = [10, 10, 20]
     for i, w in enumerate(bag_widths):
-        set_width(get_column_letter(n_in + n_loc + 1 + i), w)
-    label_widths = [11, 22, 12]
-    for i, w in enumerate(label_widths):
-        set_width(get_column_letter(n_in + n_loc + n_bag + 1 + i), w)
-    for i in range(n_woz):
+        set_width(get_column_letter(sizes["in"] + sizes["loc"] + 1 + i), w)
+    buurt_widths = [22, 14, 14, 9]
+    for i, w in enumerate(buurt_widths):
+        set_width(get_column_letter(sizes["in"] + sizes["loc"] + sizes["bag"] + 1 + i), w)
+    lab_widths = [11, 22, 12]
+    for i, w in enumerate(lab_widths):
+        set_width(get_column_letter(sizes["in"] + sizes["loc"] + sizes["bag"] + sizes["buurt"] + 1 + i), w)
+    set_width(get_column_letter(mon_col), 14)
+    afg_widths = [10, 9, 9, 12]
+    for i, w in enumerate(afg_widths):
+        set_width(get_column_letter(afg_start + i), w)
+    for i in range(sizes["woz"]):
         set_width(get_column_letter(woz_start + i), 12)
 
-    ws.freeze_panes = ws.cell(row=3, column=n_in + 1)
+    ws.freeze_panes = ws.cell(row=3, column=sizes["in"] + 1)
     ws.auto_filter.ref = f"A2:{get_column_letter(max_col)}{max_row}"
 
     # ---- Tab 2: Samenvatting ----
@@ -547,18 +837,48 @@ def _bouw_excel(header_in, rows, resultaten, peildata_sorted) -> Workbook:
 
     laatste_peildatum = peildata_sorted[0] if peildata_sorted else "—"
 
+    # Nieuw: WOZ per m²
+    per_m2 = [r.get("woz_per_m2") for r in resultaten if r.get("woz_per_m2")]
+    gem_per_m2 = int(sum(per_m2) / len(per_m2)) if per_m2 else None
+    min_per_m2 = min(per_m2) if per_m2 else None
+    max_per_m2 = max(per_m2) if per_m2 else None
+
+    # Stijgingen
+    p5 = [r.get("pct_5jr") for r in resultaten if r.get("pct_5jr") is not None]
+    gem_p5 = round(sum(p5) / len(p5), 1) if p5 else None
+    p_oudst = [r.get("pct_sinds_oudst") for r in resultaten if r.get("pct_sinds_oudst") is not None]
+    gem_p_oudst = round(sum(p_oudst) / len(p_oudst), 1) if p_oudst else None
+
+    # Mismatches
+    mismatches = sum(1 for r in resultaten if r.get("adres_match") is False)
+
+    # Monumenten
+    monumenten = sum(1 for r in resultaten if (r.get("monument") or {}).get("monumentnummer"))
+
     blokken = [
         ("Aantal adressen", [
             ("Totaal verwerkt", totaal),
             ("Succesvol gevonden", ok),
+            ("Adres-match-waarschuwingen", mismatches),
             ("Adres niet gevonden", niet_gevonden),
             ("Geen WOZ-waarde", geen_woz),
+            ("Rijksmonumenten", monumenten),
         ]),
         (f"WOZ-waarde ({laatste_peildatum})", [
             ("Aantal met WOZ", len(woz_actueel)),
             ("Gemiddeld", gem_woz),
             ("Laagste", min_woz),
             ("Hoogste", max_woz),
+        ]),
+        ("WOZ per m² (BAG-opp.)", [
+            ("Aantal met €/m²", len(per_m2)),
+            ("Gemiddeld €/m²", gem_per_m2),
+            ("Laagste €/m²", min_per_m2),
+            ("Hoogste €/m²", max_per_m2),
+        ]),
+        ("WOZ-stijging (gemiddeld)", [
+            ("% 5 jaar", gem_p5),
+            (f"% sinds oudste peiljaar", gem_p_oudst),
         ]),
         ("Energielabels", [(f"Label {k}", v) for k, v in sorted(label_count.items())] or [("Geen labels gevonden", 0)]),
         ("Bouwjaar (BAG)", [
@@ -588,8 +908,12 @@ def _bouw_excel(header_in, rows, resultaten, peildata_sorted) -> Workbook:
             ws2.cell(row=r, column=1, value=k).alignment = Alignment(indent=1)
             cv = ws2.cell(row=r, column=2, value=v)
             cv.alignment = Alignment(horizontal="right")
-            if titel.startswith("WOZ") and k != "Aantal met WOZ":
+            if titel.startswith("WOZ-waarde") and k != "Aantal met WOZ":
                 cv.number_format = '"€" #,##0'
+            elif titel.startswith("WOZ per m²") and "€/m²" in k:
+                cv.number_format = '"€" #,##0'
+            elif titel.startswith("WOZ-stijging"):
+                cv.number_format = "0.0\"%\""
             for col_idx in (1, 2):
                 ws2.cell(row=r, column=col_idx).border = Border(bottom=_BORDER)
             r += 1

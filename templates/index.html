@@ -450,8 +450,43 @@ function renderResult(d) {
     const bits = [];
     if (b.bouwjaar) bits.push(`bouwjaar <strong>${b.bouwjaar}</strong>`);
     if (b.gebruiksoppervlakte) bits.push(`<strong>${b.gebruiksoppervlakte} m²</strong>`);
+    if (d.woz_per_m2) bits.push(`<strong>${fmtEur(d.woz_per_m2)}/m²</strong>`);
     if (b.gebruiksdoel) bits.push(b.gebruiksdoel);
     if (bits.length) bagHtml = `<div class="meta">BAG: ${bits.join(' · ')}</div>`;
+  }
+
+  let buurtHtml = '';
+  if (d.cbs && d.cbs.buurtnaam) {
+    const c = d.cbs;
+    const bits = [`<strong>${c.buurtnaam}</strong>`];
+    if (c.gem_woningwaarde) bits.push(`gem. WOZ buurt ${fmtEur(c.gem_woningwaarde)}`);
+    if (c.gem_inkomen) bits.push(`gem. inkomen ${fmtEur(c.gem_inkomen)}`);
+    if (c.pct_huur != null) bits.push(`${c.pct_huur}% huur`);
+    buurtHtml = `<div class="meta">CBS-buurt: ${bits.join(' · ')}</div>`;
+  }
+
+  let monumentHtml = '';
+  if (d.monument && d.monument.monumentnummer) {
+    monumentHtml = `<div class="energie-block" style="background:#F3E8FF;border-color:#7C3AED">
+      <span class="label-badge" style="background:#7C3AED">RM</span>
+      <div><strong>Rijksmonument ${d.monument.monumentnummer}</strong>
+      <div class="meta">${d.monument.monument_straat || ''} ${d.monument.monument_huisnummer || ''}</div></div>
+    </div>`;
+  }
+
+  let mismatchHtml = '';
+  if (d.adres_match === false) {
+    mismatchHtml = `<div class="energie-block" style="background:#FFE8D6;border-color:#FF9800">
+      <span class="label-badge" style="background:#FF9800">!</span>
+      <div><strong>Adres-match-waarschuwing</strong>
+      <div class="meta">${d.adres_match_reden || '—'}</div></div>
+    </div>`;
+  }
+
+  let trendHtml = '';
+  if (d.pct_1jr != null || d.pct_5jr != null || d.pct_sinds_oudst != null) {
+    const tr = (v) => v == null ? '—' : `<span class="${v>=0?'delta-up':'delta-down'}">${v>=0?'+':''}${v}%</span>`;
+    trendHtml = `<div class="meta">Trend: 1jr ${tr(d.pct_1jr)} · 5jr ${tr(d.pct_5jr)} · sinds ${d.oudste_peiljaar || 'oudst'} ${tr(d.pct_sinds_oudst)}</div>`;
   }
 
   result.innerHTML = `
@@ -459,8 +494,12 @@ function renderResult(d) {
     <div class="meta">
       WOZ-objectnummer ${d.wozobjectnummer || '—'} · nummeraanduiding ${d.nummeraanduiding || '—'}
     </div>
+    ${mismatchHtml}
     ${bagHtml}
+    ${buurtHtml}
     ${energieHtml}
+    ${monumentHtml}
+    ${trendHtml}
     <table>
       <thead><tr><th>Peildatum</th><th style="text-align:right">Vastgestelde waarde</th></tr></thead>
       <tbody>${rows || '<tr><td colspan="2">Geen waarden bekend.</td></tr>'}</tbody>
