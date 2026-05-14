@@ -8,3 +8,5 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.3
+      - key: EPONLINE_API_KEY
+        sync: false  # waarde in Render-dashboard ingesteld; nooit committen

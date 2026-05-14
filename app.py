@@ -17,8 +17,9 @@ from typing import Optional
 import requests
 from flask import Flask, render_template, request, jsonify, send_file, abort
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.formatting.rule import CellIsRule, ColorScaleRule
 
 
 def _load_dotenv(path: str = ".env") -> None:
@@ -282,73 +283,7 @@ def api_excel():
 
     peildata_sorted = sorted(peildata, reverse=True)
 
-    # Bouw output-workbook
-    wb_out = Workbook()
-    ws = wb_out.active
-    ws.title = "WOZ-resultaten"
-
-    out_header_base = list(header) + [
-        "status",
-        "gevonden adres",
-        "postcode",
-        "woonplaats",
-        "wozobjectnummer",
-        "grondoppervlakte",
-        "nummeraanduiding",
-        "energielabel",
-        "bouwjaar",
-        "gebouwtype",
-        "label geldig tot",
-    ]
-    out_header = out_header_base + [f"WOZ {p}" for p in peildata_sorted]
-    ws.append(out_header)
-
-    # Style header
-    header_font = Font(bold=True, color="FFFFFF")
-    header_fill = PatternFill("solid", fgColor="1F4E79")
-    for col_idx, val in enumerate(out_header, start=1):
-        c = ws.cell(row=1, column=col_idx)
-        c.font = header_font
-        c.fill = header_fill
-        c.alignment = Alignment(vertical="center")
-    ws.freeze_panes = "A2"
-
-    for row, res in zip(rows[1:], resultaten):
-        ep = res.get("energielabel") or {}
-        out_row = list(row) + [
-            res.get("status"),
-            res.get("weergavenaam"),
-            res.get("postcode"),
-            res.get("woonplaats"),
-            res.get("wozobjectnummer"),
-            res.get("grondoppervlakte"),
-            res.get("nummeraanduiding"),
-            ep.get("energieklasse"),
-            ep.get("bouwjaar"),
-            ep.get("gebouwtype"),
-            ep.get("geldig_tot"),
-        ]
-        waarden_map = {w["peildatum"]: w["vastgesteldeWaarde"] for w in res.get("wozWaarden", [])}
-        for p in peildata_sorted:
-            out_row.append(waarden_map.get(p))
-        ws.append(out_row)
-
-    # Format euro-kolommen
-    if peildata_sorted:
-        eur_start = len(out_header_base) + 1
-        for col_idx in range(eur_start, len(out_header) + 1):
-            for r in range(2, ws.max_row + 1):
-                ws.cell(row=r, column=col_idx).number_format = '"€" #,##0'
-
-    # Auto-breedte (op basis van max-len, gecapped)
-    for col_idx in range(1, len(out_header) + 1):
-        max_len = len(str(out_header[col_idx - 1]))
-        for r in range(2, ws.max_row + 1):
-            v = ws.cell(row=r, column=col_idx).value
-            if v is not None:
-                max_len = max(max_len, min(len(str(v)), 40))
-        ws.column_dimensions[get_column_letter(col_idx)].width = max_len + 2
-
+    wb_out = _bouw_excel(header, rows, resultaten, peildata_sorted)
     buf = io.BytesIO()
     wb_out.save(buf)
     buf.seek(0)
@@ -359,6 +294,229 @@ def api_excel():
         download_name=naam,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+
+# --- Excel-stijlen ---
+_RED_DARK = "1F4E79"
+_RED_MID = "2E6BA8"
+_GREY = "F1F4F8"
+_BORDER = Side(style="thin", color="C8D2DD")
+_BORDER_THICK = Side(style="medium", color=_RED_DARK)
+
+_LABEL_FILL = {
+    "A++++": "009639", "A+++": "009639", "A++": "009639", "A+": "009639",
+    "A": "009639", "B": "4CAF50", "C": "8BC34A",
+    "D": "FFC107", "E": "FF9800", "F": "FF5722", "G": "D32F2F",
+}
+
+
+def _bouw_excel(header_in, rows, resultaten, peildata_sorted) -> Workbook:
+    """Bouwt een net opgemaakt resultaat-workbook met twee tabbladen."""
+    wb = Workbook()
+
+    # ---- Tab 1: Resultaten ----
+    ws = wb.active
+    ws.title = "Resultaten"
+
+    invoer_kols = list(header_in) or ["adres"]
+    locatie_kols = ["status", "gevonden adres", "postcode", "woonplaats", "BAG-id"]
+    label_kols = ["energielabel", "bouwjaar", "gebouwtype", "geldig t/m"]
+    woz_kols = [p[:4] for p in peildata_sorted]  # alleen jaartal
+
+    n_in, n_loc, n_lab, n_woz = len(invoer_kols), len(locatie_kols), len(label_kols), len(woz_kols)
+
+    # Rij 1: groepheaders (merged)
+    groepen = [("Invoer", n_in, "6B7785"),
+               ("Adres & WOZ-object", n_loc, _RED_DARK),
+               ("Energielabel (EP-online)", n_lab, "1B7A3A"),
+               ("WOZ-waarden", n_woz, _RED_MID)]
+    col = 1
+    for naam, n, kleur in groepen:
+        if n == 0:
+            continue
+        ws.cell(row=1, column=col, value=naam)
+        if n > 1:
+            ws.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col + n - 1)
+        c = ws.cell(row=1, column=col)
+        c.font = Font(bold=True, color="FFFFFF", size=11)
+        c.fill = PatternFill("solid", fgColor=kleur)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border = Border(top=_BORDER_THICK, left=_BORDER, right=_BORDER, bottom=_BORDER)
+        col += n
+    ws.row_dimensions[1].height = 24
+
+    # Rij 2: kolomheaders
+    headers_row2 = invoer_kols + locatie_kols + label_kols + woz_kols
+    for i, h in enumerate(headers_row2, start=1):
+        c = ws.cell(row=2, column=i, value=h)
+        c.font = Font(bold=True, color="1F2933", size=10)
+        c.fill = PatternFill("solid", fgColor=_GREY)
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        c.border = Border(left=_BORDER, right=_BORDER, bottom=_BORDER)
+    ws.row_dimensions[2].height = 30
+
+    # Data
+    for row, res in zip(rows[1:], resultaten):
+        ep = res.get("energielabel") or {}
+        out_row = list(row)
+        # Pad indien rij korter dan header
+        out_row += [None] * (n_in - len(out_row))
+        out_row = out_row[:n_in]
+        out_row += [
+            res.get("status"),
+            res.get("weergavenaam"),
+            res.get("postcode"),
+            res.get("woonplaats"),
+            res.get("adresseerbaarobject_id") or res.get("nummeraanduiding"),
+            ep.get("energieklasse"),
+            ep.get("bouwjaar"),
+            ep.get("gebouwtype"),
+            ep.get("geldig_tot"),
+        ]
+        waarden_map = {w["peildatum"]: w["vastgesteldeWaarde"] for w in res.get("wozWaarden", [])}
+        for p in peildata_sorted:
+            out_row.append(waarden_map.get(p))
+        ws.append(out_row)
+
+    max_row = ws.max_row
+    max_col = len(headers_row2)
+
+    # Borders op alle cellen
+    for r in range(3, max_row + 1):
+        for c_idx in range(1, max_col + 1):
+            cell = ws.cell(row=r, column=c_idx)
+            cell.border = Border(left=_BORDER, right=_BORDER, bottom=_BORDER)
+            if r % 2 == 1:
+                cell.fill = PatternFill("solid", fgColor="FAFBFC")
+
+    # Kleur energielabel-cel (col na invoer+locatie)
+    label_col_idx = n_in + n_loc + 1  # 1-based
+    for r in range(3, max_row + 1):
+        cell = ws.cell(row=r, column=label_col_idx)
+        lab = (cell.value or "").strip() if isinstance(cell.value, str) else ""
+        if lab in _LABEL_FILL:
+            cell.fill = PatternFill("solid", fgColor=_LABEL_FILL[lab])
+            light = lab in ("D",)
+            cell.font = Font(bold=True, color="1F2933" if light else "FFFFFF", size=11)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # Euro-format + ColorScale voor WOZ-kolommen
+    woz_start = n_in + n_loc + n_lab + 1
+    woz_end = woz_start + n_woz - 1
+    for c_idx in range(woz_start, woz_end + 1):
+        for r in range(3, max_row + 1):
+            ws.cell(row=r, column=c_idx).number_format = '"€" #,##0'
+        if max_row >= 3:
+            rng = f"{get_column_letter(c_idx)}3:{get_column_letter(c_idx)}{max_row}"
+            ws.conditional_formatting.add(rng, ColorScaleRule(
+                start_type="min", start_color="FFFFFF",
+                mid_type="percentile", mid_value=50, mid_color="DCE6F2",
+                end_type="max", end_color="9BB8DC",
+            ))
+
+    # Bouwjaar als getal zonder duizendtal
+    bouwjaar_col = n_in + n_loc + 2
+    for r in range(3, max_row + 1):
+        ws.cell(row=r, column=bouwjaar_col).number_format = "0"
+
+    # Kolombreedtes — zinvolle defaults
+    def set_width(col_letter, w):
+        ws.column_dimensions[col_letter].width = w
+
+    for i in range(1, n_in + 1):
+        set_width(get_column_letter(i), 38)
+    locatie_widths = [11, 38, 10, 18, 18]
+    for i, w in enumerate(locatie_widths):
+        set_width(get_column_letter(n_in + 1 + i), w)
+    label_widths = [11, 10, 22, 12]
+    for i, w in enumerate(label_widths):
+        set_width(get_column_letter(n_in + n_loc + 1 + i), w)
+    for i in range(n_woz):
+        set_width(get_column_letter(woz_start + i), 12)
+
+    ws.freeze_panes = ws.cell(row=3, column=n_in + 1)
+    ws.auto_filter.ref = f"A2:{get_column_letter(max_col)}{max_row}"
+
+    # ---- Tab 2: Samenvatting ----
+    ws2 = wb.create_sheet("Samenvatting")
+    ws2.column_dimensions["A"].width = 36
+    ws2.column_dimensions["B"].width = 18
+
+    title = ws2.cell(row=1, column=1, value="Samenvatting WOZ + energielabel")
+    title.font = Font(bold=True, size=14, color="FFFFFF")
+    title.fill = PatternFill("solid", fgColor=_RED_DARK)
+    ws2.merge_cells("A1:B1")
+    ws2.row_dimensions[1].height = 28
+    ws2["A1"].alignment = Alignment(horizontal="left", vertical="center", indent=1)
+
+    totaal = len(resultaten)
+    ok = sum(1 for r in resultaten if r.get("status") == "OK")
+    niet_gevonden = sum(1 for r in resultaten if r.get("status") in ("Adres niet gevonden", "Geen nummeraanduiding"))
+    geen_woz = totaal - ok - niet_gevonden
+
+    woz_actueel = [r["wozWaarden"][0]["vastgesteldeWaarde"]
+                   for r in resultaten if r.get("wozWaarden") and r["wozWaarden"][0].get("vastgesteldeWaarde")]
+    gem_woz = int(sum(woz_actueel) / len(woz_actueel)) if woz_actueel else None
+    min_woz = min(woz_actueel) if woz_actueel else None
+    max_woz = max(woz_actueel) if woz_actueel else None
+
+    labels_lijst = [(r.get("energielabel") or {}).get("energieklasse") for r in resultaten]
+    labels_lijst = [l for l in labels_lijst if l]
+    label_count = {}
+    for l in labels_lijst:
+        label_count[l] = label_count.get(l, 0) + 1
+
+    bouwjaren = [(r.get("energielabel") or {}).get("bouwjaar") for r in resultaten]
+    bouwjaren = [b for b in bouwjaren if isinstance(b, int) and b > 1500]
+    gem_bj = int(sum(bouwjaren) / len(bouwjaren)) if bouwjaren else None
+    oudste = min(bouwjaren) if bouwjaren else None
+    nieuwste = max(bouwjaren) if bouwjaren else None
+
+    laatste_peildatum = peildata_sorted[0] if peildata_sorted else "—"
+
+    blokken = [
+        ("Aantal adressen", [
+            ("Totaal verwerkt", totaal),
+            ("Succesvol gevonden", ok),
+            ("Adres niet gevonden", niet_gevonden),
+            ("Geen WOZ-waarde", geen_woz),
+        ]),
+        (f"WOZ-waarde ({laatste_peildatum})", [
+            ("Aantal met WOZ", len(woz_actueel)),
+            ("Gemiddeld", gem_woz),
+            ("Laagste", min_woz),
+            ("Hoogste", max_woz),
+        ]),
+        ("Energielabels", [(f"Label {k}", v) for k, v in sorted(label_count.items())] or [("Geen labels gevonden", 0)]),
+        ("Bouwjaar", [
+            ("Aantal met bouwjaar", len(bouwjaren)),
+            ("Gemiddeld", gem_bj),
+            ("Oudst", oudste),
+            ("Nieuwst", nieuwste),
+        ]),
+    ]
+
+    r = 3
+    for titel, items in blokken:
+        c = ws2.cell(row=r, column=1, value=titel)
+        c.font = Font(bold=True, color="FFFFFF", size=11)
+        c.fill = PatternFill("solid", fgColor=_RED_MID)
+        c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+        ws2.merge_cells(start_row=r, start_column=1, end_row=r, end_column=2)
+        ws2.row_dimensions[r].height = 20
+        r += 1
+        for k, v in items:
+            ws2.cell(row=r, column=1, value=k).alignment = Alignment(indent=1)
+            cv = ws2.cell(row=r, column=2, value=v)
+            cv.alignment = Alignment(horizontal="right")
+            if titel.startswith("WOZ") and k != "Aantal met WOZ":
+                cv.number_format = '"€" #,##0'
+            for col_idx in (1, 2):
+                ws2.cell(row=r, column=col_idx).border = Border(bottom=_BORDER)
+            r += 1
+        r += 1  # lege tussen blokken
+
+    return wb
 
 
 @app.route("/api/template")
