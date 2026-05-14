@@ -1,0 +1,320 @@
+"""WOZ-waardeloket webtool.
+
+Lokaal Flask-webserver dat:
+- PDOK Locatieserver gebruikt om adres -> nummeraanduiding te resolven
+- WOZ-waardeloket API (api.kadaster.nl) aanroept om WOZ-waarden op te vragen
+- Enkel adres in browser laat invoeren OF batch Excel upload + download
+
+Start: python3 app.py  ->  open http://127.0.0.1:5005
+"""
+
+import io
+import time
+import re
+from typing import Optional
+
+import requests
+from flask import Flask, render_template, request, jsonify, send_file, abort
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+
+app = Flask(__name__)
+
+PDOK_FREE = "https://api.pdok.nl/bzk/locatieserver/search/v3_1/free"
+PDOK_SUGGEST = "https://api.pdok.nl/bzk/locatieserver/search/v3_1/suggest"
+WOZ_API = "https://api.kadaster.nl/lvwoz/wozwaardeloket-api/v1/wozwaarde/nummeraanduiding/{}"
+WOZ_HEADERS = {
+    "Accept": "application/json",
+    "Origin": "https://www.wozwaardeloket.nl",
+    "Referer": "https://www.wozwaardeloket.nl/",
+    "User-Agent": "Mozilla/5.0 (WOZ-tool lokaal)",
+}
+
+REQUEST_TIMEOUT = 15
+session = requests.Session()
+
+
+def zoek_adres(query: str) -> Optional[dict]:
+    """Zoekt een adres via PDOK Locatieserver. Returnt eerste hit of None."""
+    try:
+        r = session.get(
+            PDOK_FREE,
+            params={"q": query, "fq": "type:adres", "rows": 1},
+            timeout=REQUEST_TIMEOUT,
+        )
+        r.raise_for_status()
+        docs = r.json().get("response", {}).get("docs", [])
+        return docs[0] if docs else None
+    except requests.RequestException:
+        return None
+
+
+def haal_woz(nummeraanduiding_id: str) -> Optional[dict]:
+    """Haalt WOZ-waarden op via Kadaster-API. Returnt dict of None bij 404."""
+    try:
+        r = session.get(
+            WOZ_API.format(nummeraanduiding_id),
+            headers=WOZ_HEADERS,
+            timeout=REQUEST_TIMEOUT,
+        )
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+    except requests.RequestException:
+        return None
+
+
+def maak_resultaat(adres: str) -> dict:
+    """Combineert adres-resolve + WOZ-call tot één resultaat-dict."""
+    hit = zoek_adres(adres)
+    if not hit:
+        return {"adres_invoer": adres, "status": "Adres niet gevonden", "wozWaarden": []}
+
+    weergavenaam = hit.get("weergavenaam", "")
+    nummeraanduiding = hit.get("nummeraanduiding_id")
+    if not nummeraanduiding:
+        return {"adres_invoer": adres, "status": "Geen nummeraanduiding", "wozWaarden": []}
+
+    woz = haal_woz(nummeraanduiding)
+    if not woz:
+        return {
+            "adres_invoer": adres,
+            "weergavenaam": weergavenaam,
+            "nummeraanduiding": nummeraanduiding,
+            "status": "Geen WOZ-waarde bekend (niet-woning of onbekend)",
+            "wozWaarden": [],
+        }
+
+    obj = woz.get("wozObject", {}) or {}
+    waarden = woz.get("wozWaarden", []) or []
+
+    return {
+        "adres_invoer": adres,
+        "weergavenaam": weergavenaam,
+        "nummeraanduiding": nummeraanduiding,
+        "status": "OK",
+        "wozobjectnummer": obj.get("wozobjectnummer"),
+        "straat": obj.get("openbareruimtenaam"),
+        "huisnummer": obj.get("huisnummer"),
+        "huisletter": obj.get("huisletter"),
+        "huisnummertoevoeging": obj.get("huisnummertoevoeging"),
+        "postcode": obj.get("postcode"),
+        "woonplaats": obj.get("woonplaatsnaam"),
+        "grondoppervlakte": obj.get("grondoppervlakte"),
+        "wozWaarden": sorted(
+            [
+                {"peildatum": w.get("peildatum"), "vastgesteldeWaarde": w.get("vastgesteldeWaarde")}
+                for w in waarden
+            ],
+            key=lambda x: x["peildatum"] or "",
+            reverse=True,
+        ),
+    }
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/api/suggest")
+def api_suggest():
+    """Auto-suggest endpoint voor het zoekveld."""
+    q = (request.args.get("q") or "").strip()
+    if len(q) < 3:
+        return jsonify([])
+    try:
+        r = session.get(
+            PDOK_SUGGEST,
+            params={"q": q, "fq": "type:adres", "rows": 8},
+            timeout=REQUEST_TIMEOUT,
+        )
+        r.raise_for_status()
+        docs = r.json().get("response", {}).get("docs", [])
+        return jsonify([{"id": d.get("id"), "weergavenaam": d.get("weergavenaam")} for d in docs])
+    except requests.RequestException as e:
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/woz")
+def api_woz():
+    """Single-address lookup endpoint."""
+    adres = (request.args.get("adres") or "").strip()
+    if not adres:
+        return jsonify({"error": "Parameter 'adres' is verplicht"}), 400
+    return jsonify(maak_resultaat(adres))
+
+
+@app.route("/api/excel", methods=["POST"])
+def api_excel():
+    """Batch-verwerking: Excel in -> Excel out met WOZ-data."""
+    if "file" not in request.files:
+        abort(400, "Geen bestand geüpload (veldnaam: 'file').")
+    upload = request.files["file"]
+    if not upload.filename.lower().endswith((".xlsx", ".xlsm")):
+        abort(400, "Alleen .xlsx of .xlsm bestanden worden ondersteund.")
+
+    try:
+        wb_in = load_workbook(io.BytesIO(upload.read()), data_only=True)
+    except Exception as e:
+        abort(400, f"Kan Excel niet lezen: {e}")
+
+    ws_in = wb_in.active
+    rows = list(ws_in.iter_rows(values_only=True))
+    if not rows:
+        abort(400, "Het Excel-bestand is leeg.")
+
+    header = [str(c) if c is not None else "" for c in rows[0]]
+    header_lower = [h.lower().strip() for h in header]
+
+    # Probeer een adres-kolom te vinden. Anders: hele rij plakken.
+    adres_idx = None
+    for i, h in enumerate(header_lower):
+        if h in ("adres", "address", "weergavenaam", "volledig adres", "volledig_adres"):
+            adres_idx = i
+            break
+
+    straat_idx = next((i for i, h in enumerate(header_lower) if h in ("straat", "straatnaam", "openbareruimte")), None)
+    huisnummer_idx = next((i for i, h in enumerate(header_lower) if h in ("huisnummer", "nr", "nummer")), None)
+    toevoeging_idx = next((i for i, h in enumerate(header_lower) if h in ("toevoeging", "huisletter", "huisnummertoevoeging")), None)
+    postcode_idx = next((i for i, h in enumerate(header_lower) if h in ("postcode", "pc")), None)
+    plaats_idx = next((i for i, h in enumerate(header_lower) if h in ("plaats", "woonplaats", "stad", "gemeente")), None)
+
+    def adres_uit_rij(row):
+        if adres_idx is not None and row[adres_idx]:
+            return str(row[adres_idx]).strip()
+        parts = []
+        if straat_idx is not None and row[straat_idx]:
+            parts.append(str(row[straat_idx]).strip())
+        if huisnummer_idx is not None and row[huisnummer_idx] not in (None, ""):
+            parts.append(str(row[huisnummer_idx]).strip())
+        if toevoeging_idx is not None and row[toevoeging_idx]:
+            parts.append(str(row[toevoeging_idx]).strip())
+        if postcode_idx is not None and row[postcode_idx]:
+            parts.append(str(row[postcode_idx]).strip())
+        if plaats_idx is not None and row[plaats_idx]:
+            parts.append(str(row[plaats_idx]).strip())
+        return " ".join(parts).strip()
+
+    # Verzamel resultaten en bepaal welke peildata voorkomen
+    resultaten = []
+    peildata = set()
+    for row in rows[1:]:
+        adres = adres_uit_rij(row)
+        if not adres:
+            resultaten.append({"adres_invoer": "", "status": "Leeg", "wozWaarden": []})
+            continue
+        res = maak_resultaat(adres)
+        for w in res["wozWaarden"]:
+            if w.get("peildatum"):
+                peildata.add(w["peildatum"])
+        resultaten.append(res)
+        time.sleep(0.15)  # voorkom rate-limit (60/min)
+
+    peildata_sorted = sorted(peildata, reverse=True)
+
+    # Bouw output-workbook
+    wb_out = Workbook()
+    ws = wb_out.active
+    ws.title = "WOZ-resultaten"
+
+    out_header_base = list(header) + [
+        "status",
+        "gevonden adres",
+        "postcode",
+        "woonplaats",
+        "wozobjectnummer",
+        "grondoppervlakte",
+        "nummeraanduiding",
+    ]
+    out_header = out_header_base + [f"WOZ {p}" for p in peildata_sorted]
+    ws.append(out_header)
+
+    # Style header
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    for col_idx, val in enumerate(out_header, start=1):
+        c = ws.cell(row=1, column=col_idx)
+        c.font = header_font
+        c.fill = header_fill
+        c.alignment = Alignment(vertical="center")
+    ws.freeze_panes = "A2"
+
+    for row, res in zip(rows[1:], resultaten):
+        out_row = list(row) + [
+            res.get("status"),
+            res.get("weergavenaam"),
+            res.get("postcode"),
+            res.get("woonplaats"),
+            res.get("wozobjectnummer"),
+            res.get("grondoppervlakte"),
+            res.get("nummeraanduiding"),
+        ]
+        waarden_map = {w["peildatum"]: w["vastgesteldeWaarde"] for w in res.get("wozWaarden", [])}
+        for p in peildata_sorted:
+            out_row.append(waarden_map.get(p))
+        ws.append(out_row)
+
+    # Format euro-kolommen
+    if peildata_sorted:
+        eur_start = len(out_header_base) + 1
+        for col_idx in range(eur_start, len(out_header) + 1):
+            for r in range(2, ws.max_row + 1):
+                ws.cell(row=r, column=col_idx).number_format = '"€" #,##0'
+
+    # Auto-breedte (op basis van max-len, gecapped)
+    for col_idx in range(1, len(out_header) + 1):
+        max_len = len(str(out_header[col_idx - 1]))
+        for r in range(2, ws.max_row + 1):
+            v = ws.cell(row=r, column=col_idx).value
+            if v is not None:
+                max_len = max(max_len, min(len(str(v)), 40))
+        ws.column_dimensions[get_column_letter(col_idx)].width = max_len + 2
+
+    buf = io.BytesIO()
+    wb_out.save(buf)
+    buf.seek(0)
+    naam = re.sub(r"\.xlsx?$", "", upload.filename, flags=re.I) + "_woz.xlsx"
+    return send_file(
+        buf,
+        as_attachment=True,
+        download_name=naam,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.route("/api/template")
+def api_template():
+    """Genereer een lege voorbeeld-Excel die gebruiker kan invullen."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Adressen"
+    ws.append(["adres"])
+    voorbeelden = [
+        "Witte de Withstraat 1D, 3012BK Rotterdam",
+        "Vondelstraat 70, 1054GG Amsterdam",
+        "Bloemstraat 1, 3581WB Utrecht",
+    ]
+    for v in voorbeelden:
+        ws.append([v])
+
+    ws["A1"].font = Font(bold=True, color="FFFFFF")
+    ws["A1"].fill = PatternFill("solid", fgColor="1F4E79")
+    ws.column_dimensions["A"].width = 55
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return send_file(
+        buf,
+        as_attachment=True,
+        download_name="woz_template.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+if __name__ == "__main__":
+    print("\n  WOZ-tool gestart op  http://127.0.0.1:5005\n")
+    app.run(host="127.0.0.1", port=5005, debug=False)
