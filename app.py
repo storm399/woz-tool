@@ -977,8 +977,14 @@ def _bouw_excel(header_in, rows, resultaten, peildata_sorted) -> Workbook:
     def set_width(col_letter, w):
         ws.column_dimensions[col_letter].width = w
 
+    # Invoer-kolommen: auto-fit op werkelijke inhoud (min 8, max 38)
     for i in range(1, sizes["in"] + 1):
-        set_width(get_column_letter(i), 38)
+        max_len = len(str(invoer_kols[i - 1]))
+        for r in range(3, ws.max_row + 1):
+            v = ws.cell(row=r, column=i).value
+            if v is not None:
+                max_len = max(max_len, len(str(v)))
+        set_width(get_column_letter(i), max(8, min(max_len + 2, 38)))
     loc_widths = [11, 8, 38, 10, 16, 18]
     for i, w in enumerate(loc_widths):
         set_width(get_column_letter(sizes["in"] + 1 + i), w)
