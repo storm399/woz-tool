@@ -153,7 +153,7 @@ def _bereken_afgeleiden(res: dict) -> None:
 
 
 def zoek_adres(query: str) -> Optional[dict]:
-    """Zoekt een adres via PDOK Locatieserver. Returnt eerste hit of None."""
+    """Fuzzy adres-zoek via PDOK (single-lookup). Returnt eerste hit of None."""
     try:
         r = session.get(
             PDOK_FREE,
@@ -165,6 +165,90 @@ def zoek_adres(query: str) -> Optional[dict]:
         return docs[0] if docs else None
     except requests.RequestException:
         return None
+
+
+def _norm_postcode(pc: str) -> str:
+    """Normaliseert een NL-postcode naar '1234AB' (uppercase, geen spaties)."""
+    if not pc:
+        return ""
+    return re.sub(r"\s+", "", str(pc)).upper()
+
+
+def _norm_letter(s) -> Optional[str]:
+    if s is None or s == "":
+        return None
+    s = str(s).strip()
+    return s.upper() if s else None
+
+
+def _norm_toev(s) -> Optional[str]:
+    if s is None or s == "":
+        return None
+    s = str(s).strip()
+    return s if s else None
+
+
+def zoek_adres_strict(
+    postcode: str,
+    huisnummer,
+    huisletter=None,
+    huisnummertoevoeging=None,
+) -> Optional[dict]:
+    """Strict adres-zoek op postcode + huisnummer (primair) + letter/toevoeging.
+
+    Gebruikt PDOK Locatieserver met filterquery, geen fuzzy match op straat.
+    Filtert vervolgens op huisletter en huisnummertoevoeging als die zijn gegeven.
+    """
+    pc = _norm_postcode(postcode)
+    if not pc or huisnummer in (None, ""):
+        return None
+    try:
+        nr = int(str(huisnummer).strip())
+    except (TypeError, ValueError):
+        return None
+
+    letter = _norm_letter(huisletter)
+    toev = _norm_toev(huisnummertoevoeging)
+
+    try:
+        r = session.get(
+            PDOK_FREE,
+            params=[
+                ("fq", "type:adres"),
+                ("fq", f"postcode:{pc}"),
+                ("fq", f"huisnummer:{nr}"),
+                ("rows", 25),
+            ],
+            timeout=REQUEST_TIMEOUT,
+        )
+        r.raise_for_status()
+        docs = r.json().get("response", {}).get("docs", []) or []
+    except requests.RequestException:
+        return None
+
+    if not docs:
+        return None
+
+    def candidate_score(d):
+        # Hoger = beter
+        score = 0
+        d_letter = _norm_letter(d.get("huisletter"))
+        d_toev = _norm_toev(d.get("huisnummertoevoeging"))
+        if letter and d_letter == letter:
+            score += 10
+        elif not letter and not d_letter:
+            score += 5
+        if toev and d_toev == toev:
+            score += 10
+        elif not toev and not d_toev:
+            score += 5
+        # Strikt geval: beide gevuld én matchen
+        if letter and toev and d_letter == letter and d_toev == toev:
+            score += 50
+        return score
+
+    docs.sort(key=candidate_score, reverse=True)
+    return docs[0]
 
 
 def haal_woz(nummeraanduiding_id: str) -> Optional[dict]:
@@ -365,21 +449,23 @@ def haal_energielabel(adresseerbaar_object_id: str) -> Optional[dict]:
         return None
 
 
-def maak_resultaat(adres: str) -> dict:
-    """Combineert adres-resolve + WOZ-call + energielabel tot één resultaat-dict."""
-    hit = zoek_adres(adres)
-    if not hit:
-        return {"adres_invoer": adres, "status": "Adres niet gevonden", "wozWaarden": []}
+def _resultaat_uit_hit(hit: dict, adres_invoer: str, ref_straat: Optional[str] = None) -> dict:
+    """Gemeenschappelijke verrijkingsflow: vanuit een PDOK-hit alle koppelingen draaien.
 
+    `ref_straat` (optioneel) wordt alleen gebruikt voor straat-verificatie:
+    als ingevulde straat duidelijk afwijkt van de gevonden straat, krijgt het
+    resultaat een 'straat_verschilt'-flag (true-positief is niet leidend, het
+    matchen zelf gebeurt op postcode+huisnummer).
+    """
     weergavenaam = hit.get("weergavenaam", "")
     nummeraanduiding = hit.get("nummeraanduiding_id")
     adresseerbaar_object_id = hit.get("adresseerbaarobject_id")
     if not nummeraanduiding:
-        return {"adres_invoer": adres, "status": "Geen nummeraanduiding", "wozWaarden": []}
+        return {"adres_invoer": adres_invoer, "weergavenaam": weergavenaam,
+                "status": "Geen nummeraanduiding", "wozWaarden": []}
 
     buurtcode = hit.get("buurtcode")
     buurtnaam = hit.get("buurtnaam")
-    woonplaatsnaam_pdok = hit.get("woonplaatsnaam")
 
     woz = haal_woz(nummeraanduiding)
     bag = haal_bag(adresseerbaar_object_id) if adresseerbaar_object_id else None
@@ -387,42 +473,39 @@ def maak_resultaat(adres: str) -> dict:
     cbs = haal_cbs_buurt(buurtcode) if buurtcode else None
     monument = haal_monument(bag.get("pand_id") if bag else None)
 
-    if not woz:
-        res_geen = {
-            "adres_invoer": adres,
-            "weergavenaam": weergavenaam,
-            "nummeraanduiding": nummeraanduiding,
-            "adresseerbaarobject_id": adresseerbaar_object_id,
-            "buurtnaam": buurtnaam,
-            "buurtcode": buurtcode,
-            "cbs": cbs,
-            "monument": monument,
-            "status": "Geen WOZ-waarde bekend (niet-woning of onbekend)",
-            "wozWaarden": [],
-            "bag": bag,
-            "energielabel": energielabel,
-        }
-        _bereken_afgeleiden(res_geen)
-        return res_geen
-
-    obj = woz.get("wozObject", {}) or {}
-    waarden = woz.get("wozWaarden", []) or []
-
-    res = {
-        "adres_invoer": adres,
+    base = {
+        "adres_invoer": adres_invoer,
         "weergavenaam": weergavenaam,
         "nummeraanduiding": nummeraanduiding,
         "adresseerbaarobject_id": adresseerbaar_object_id,
         "buurtnaam": buurtnaam,
         "buurtcode": buurtcode,
+        "bag": bag,
+        "energielabel": energielabel,
+        "cbs": cbs,
+        "monument": monument,
+    }
+
+    if not woz:
+        base.update({
+            "status": "Geen WOZ-waarde bekend (niet-woning of onbekend)",
+            "wozWaarden": [],
+        })
+        _bereken_afgeleiden(base)
+        _verifieer_straat(base, ref_straat, hit)
+        return base
+
+    obj = woz.get("wozObject", {}) or {}
+    waarden = woz.get("wozWaarden", []) or []
+    base.update({
         "status": "OK",
         "wozobjectnummer": obj.get("wozobjectnummer"),
-        "straat": obj.get("openbareruimtenaam"),
-        "huisnummer": obj.get("huisnummer"),
-        "huisletter": obj.get("huisletter"),
-        "huisnummertoevoeging": obj.get("huisnummertoevoeging"),
-        "postcode": obj.get("postcode"),
-        "woonplaats": obj.get("woonplaatsnaam"),
+        "straat": obj.get("openbareruimtenaam") or hit.get("straatnaam"),
+        "huisnummer": obj.get("huisnummer") or hit.get("huisnummer"),
+        "huisletter": obj.get("huisletter") or hit.get("huisletter"),
+        "huisnummertoevoeging": obj.get("huisnummertoevoeging") or hit.get("huisnummertoevoeging"),
+        "postcode": obj.get("postcode") or hit.get("postcode"),
+        "woonplaats": obj.get("woonplaatsnaam") or hit.get("woonplaatsnaam"),
         "grondoppervlakte": obj.get("grondoppervlakte"),
         "wozWaarden": sorted(
             [
@@ -432,12 +515,65 @@ def maak_resultaat(adres: str) -> dict:
             key=lambda x: x["peildatum"] or "",
             reverse=True,
         ),
-        "bag": bag,
-        "energielabel": energielabel,
-        "cbs": cbs,
-        "monument": monument,
-    }
-    _bereken_afgeleiden(res)
+    })
+    _bereken_afgeleiden(base)
+    _verifieer_straat(base, ref_straat, hit)
+    return base
+
+
+def _verifieer_straat(res: dict, ref_straat: Optional[str], hit: dict) -> None:
+    """Markeert in res of een opgegeven referentie-straat afwijkt van wat PDOK vond.
+
+    Alleen ter informatie — de match zelf is al gedaan op postcode+huisnummer.
+    """
+    if not ref_straat:
+        return
+    gevonden = res.get("straat") or hit.get("straatnaam") or ""
+    ref_norm = _normaliseer(ref_straat)
+    gev_norm = _normaliseer(gevonden)
+    if not gev_norm or not ref_norm:
+        return
+    # Match als één in de ander zit (compenseert "Wittedewithstraat" vs "Witte de Withstraat")
+    ok = ref_norm in gev_norm or gev_norm in ref_norm
+    if not ok:
+        res["straat_verschilt"] = True
+        res["straat_invoer"] = ref_straat
+        res["straat_gevonden"] = gevonden
+
+
+def maak_resultaat(adres: str) -> dict:
+    """Fuzzy adres-flow voor losse opvragingen. Houdt huidig gedrag voor /api/woz."""
+    hit = zoek_adres(adres)
+    if not hit:
+        return {"adres_invoer": adres, "status": "Adres niet gevonden", "wozWaarden": []}
+    return _resultaat_uit_hit(hit, adres_invoer=adres)
+
+
+def maak_resultaat_strict(
+    postcode: str,
+    huisnummer,
+    huisletter=None,
+    huisnummertoevoeging=None,
+    straat: Optional[str] = None,
+    plaats: Optional[str] = None,
+    adres_invoer: Optional[str] = None,
+) -> dict:
+    """Strict match: postcode + huisnummer leidend. Straat alleen ter verificatie."""
+    invoer_label = adres_invoer or " ".join(
+        str(p) for p in (straat, huisnummer, huisletter, huisnummertoevoeging,
+                          postcode, plaats) if p not in (None, "")
+    ).strip()
+
+    hit = zoek_adres_strict(postcode, huisnummer, huisletter, huisnummertoevoeging)
+    if not hit:
+        return {
+            "adres_invoer": invoer_label,
+            "status": "Adres niet gevonden op postcode + huisnummer",
+            "wozWaarden": [],
+            "match_modus": "strict",
+        }
+    res = _resultaat_uit_hit(hit, adres_invoer=invoer_label, ref_straat=straat)
+    res["match_modus"] = "strict"
     return res
 
 
@@ -503,38 +639,108 @@ def api_excel():
             adres_idx = i
             break
 
-    straat_idx = next((i for i, h in enumerate(header_lower) if h in ("straat", "straatnaam", "openbareruimte")), None)
-    huisnummer_idx = next((i for i, h in enumerate(header_lower) if h in ("huisnummer", "nr", "nummer")), None)
-    toevoeging_idx = next((i for i, h in enumerate(header_lower) if h in ("toevoeging", "huisletter", "huisnummertoevoeging")), None)
+    straat_idx = next((i for i, h in enumerate(header_lower) if h in ("straat", "straatnaam", "openbareruimte", "openbareruimtenaam")), None)
+    huisnummer_idx = next((i for i, h in enumerate(header_lower) if h in ("huisnummer", "nr", "nummer", "huisnr")), None)
+    letter_idx = next((i for i, h in enumerate(header_lower) if h in ("huisletter", "letter")), None)
+    toevoeging_idx = next((i for i, h in enumerate(header_lower) if h in ("toevoeging", "huisnummertoevoeging", "huisnrtoevoeging")), None)
     postcode_idx = next((i for i, h in enumerate(header_lower) if h in ("postcode", "pc")), None)
     plaats_idx = next((i for i, h in enumerate(header_lower) if h in ("plaats", "woonplaats", "stad", "gemeente")), None)
 
-    def adres_uit_rij(row):
+    def _val(row, idx):
+        if idx is None:
+            return None
+        v = row[idx] if idx < len(row) else None
+        if v in (None, ""):
+            return None
+        return v
+
+    def _adres_label(row) -> str:
         if adres_idx is not None and row[adres_idx]:
             return str(row[adres_idx]).strip()
         parts = []
-        if straat_idx is not None and row[straat_idx]:
-            parts.append(str(row[straat_idx]).strip())
-        if huisnummer_idx is not None and row[huisnummer_idx] not in (None, ""):
-            parts.append(str(row[huisnummer_idx]).strip())
-        if toevoeging_idx is not None and row[toevoeging_idx]:
-            parts.append(str(row[toevoeging_idx]).strip())
-        if postcode_idx is not None and row[postcode_idx]:
-            parts.append(str(row[postcode_idx]).strip())
-        if plaats_idx is not None and row[plaats_idx]:
-            parts.append(str(row[plaats_idx]).strip())
+        for idx in (straat_idx, huisnummer_idx, letter_idx, toevoeging_idx, postcode_idx, plaats_idx):
+            v = _val(row, idx)
+            if v is not None:
+                parts.append(str(v).strip())
         return " ".join(parts).strip()
 
-    # Verzamel resultaten en bepaal welke peildata voorkomen
+    def _parse_huisnr_combo(s):
+        """Splitst '12A' / '12-2' / '12 bis' in (nummer, letter, toevoeging)."""
+        s = str(s).strip()
+        m = re.match(r"^(\d+)\s*([A-Za-z])?\s*[-/]?\s*(.*)$", s)
+        if not m:
+            return None, None, None
+        return m.group(1), (m.group(2) or None), (m.group(3) or None)
+
+    def _strict_kwargs(row):
+        """Probeert postcode + huisnummer uit de rij te halen voor strict-match."""
+        pc = _val(row, postcode_idx)
+        nr = _val(row, huisnummer_idx)
+        letter = _val(row, letter_idx)
+        toev = _val(row, toevoeging_idx)
+        straat = _val(row, straat_idx)
+        plaats = _val(row, plaats_idx)
+
+        if pc and nr is not None:
+            # Als nummer in het veld als '12A' staat, splits letter eruit
+            if letter is None and isinstance(nr, str) and re.search(r"[A-Za-z]", nr):
+                num, lt, tv = _parse_huisnr_combo(nr)
+                nr = num or nr
+                letter = letter or lt
+                toev = toev or tv
+            return {
+                "postcode": pc,
+                "huisnummer": nr,
+                "huisletter": letter,
+                "huisnummertoevoeging": toev,
+                "straat": straat,
+                "plaats": plaats,
+            }
+        # Probeer ook uit een vrije adres-string een postcode+nr te halen
+        if adres_idx is not None and row[adres_idx]:
+            adres = str(row[adres_idx])
+            pc_match = re.search(r"\b([1-9]\d{3}\s?[A-Za-z]{2})\b", adres)
+            nr_match = re.search(r"\b(\d{1,5})\b", adres)
+            if pc_match and nr_match:
+                # Eerste cijferreeks die NIET binnen postcode valt
+                nrs = re.findall(r"\b(\d{1,5})\b", adres)
+                pc_digits = pc_match.group(1)[:4]
+                nrs_clean = [n for n in nrs if n != pc_digits]
+                if nrs_clean:
+                    return {
+                        "postcode": pc_match.group(1),
+                        "huisnummer": nrs_clean[0],
+                        "huisletter": None,
+                        "huisnummertoevoeging": None,
+                        "straat": straat,
+                        "plaats": plaats,
+                    }
+        return None
+
+    # Verzamel resultaten — postcode+huisnummer leidend, fallback op fuzzy
     resultaten = []
     peildata = set()
     for row in rows[1:]:
-        adres = adres_uit_rij(row)
-        if not adres:
+        adres_label = _adres_label(row)
+        if not adres_label:
             resultaten.append({"adres_invoer": "", "status": "Leeg", "wozWaarden": []})
             continue
-        res = maak_resultaat(adres)
-        for w in res["wozWaarden"]:
+
+        strict = _strict_kwargs(row)
+        if strict:
+            res = maak_resultaat_strict(adres_invoer=adres_label, **strict)
+            # Als strict niets vond, val terug op fuzzy als noodgreep
+            if res.get("status", "").startswith("Adres niet gevonden"):
+                fb = maak_resultaat(adres_label)
+                if fb.get("status") == "OK":
+                    fb["match_modus"] = "fuzzy-fallback"
+                    fb["fallback_reden"] = "strict op postcode+huisnummer leverde geen hit"
+                    res = fb
+        else:
+            res = maak_resultaat(adres_label)
+            res["match_modus"] = "fuzzy"
+
+        for w in res.get("wozWaarden") or []:
             if w.get("peildatum"):
                 peildata.add(w["peildatum"])
         resultaten.append(res)
@@ -921,7 +1127,352 @@ def _bouw_excel(header_in, rows, resultaten, peildata_sorted) -> Workbook:
             r += 1
         r += 1  # lege tussen blokken
 
+    # ---- Tabs 3-7: deelviews per onderwerp ----
+    _bouw_subtabs(wb, resultaten, peildata_sorted)
+
     return wb
+
+
+def _bouw_subtabs(wb: Workbook, resultaten: list, peildata_sorted: list) -> None:
+    """Voegt aparte tabbladen toe per onderwerp, voor snel filteren per categorie."""
+    _bouw_tab_woz(wb, resultaten, peildata_sorted)
+    _bouw_tab_energielabel(wb, resultaten)
+    _bouw_tab_bag(wb, resultaten)
+    _bouw_tab_buurt(wb, resultaten)
+    _bouw_tab_monumenten(wb, resultaten)
+    _bouw_tab_matchwarnings(wb, resultaten)
+
+
+def _adres_kolommen(res: dict) -> list:
+    """Standaard set adres-identifier kolommen voor elke deelview."""
+    return [
+        res.get("postcode") or "",
+        res.get("huisnummer") or "",
+        res.get("huisletter") or "",
+        res.get("huisnummertoevoeging") or "",
+        res.get("straat") or "",
+        res.get("woonplaats") or "",
+        res.get("weergavenaam") or res.get("adres_invoer") or "",
+    ]
+
+
+_ADRES_HEADERS = ["postcode", "huisnr", "letter", "toev", "straat", "plaats", "gevonden adres"]
+
+
+def _stijl_subtab_header(ws, kleur: str, kolomnamen: list, breedtes: list) -> None:
+    """Past de standaard 2-rij header toe op een sub-tabblad."""
+    titel = ws.title
+    ws.cell(row=1, column=1, value=titel)
+    n = len(kolomnamen)
+    if n > 1:
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n)
+    c = ws.cell(row=1, column=1)
+    c.font = Font(bold=True, color="FFFFFF", size=12)
+    c.fill = PatternFill("solid", fgColor=kleur)
+    c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+    ws.row_dimensions[1].height = 26
+
+    for i, h in enumerate(kolomnamen, start=1):
+        cell = ws.cell(row=2, column=i, value=h)
+        cell.font = Font(bold=True, color="1F2933", size=10)
+        cell.fill = PatternFill("solid", fgColor=_GREY)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = Border(left=_BORDER, right=_BORDER, bottom=_BORDER)
+    ws.row_dimensions[2].height = 30
+
+    for i, w in enumerate(breedtes, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+
+def _zebra_en_borders(ws, max_col: int) -> None:
+    for r in range(3, ws.max_row + 1):
+        for c_idx in range(1, max_col + 1):
+            cell = ws.cell(row=r, column=c_idx)
+            cell.border = Border(left=_BORDER, right=_BORDER, bottom=_BORDER)
+            if r % 2 == 1:
+                cell.fill = PatternFill("solid", fgColor="FAFBFC")
+
+
+def _bouw_tab_woz(wb, resultaten, peildata_sorted) -> None:
+    ws = wb.create_sheet("WOZ-waardeloket")
+    oudst_jaar = peildata_sorted[-1][:4] if peildata_sorted else "oudst"
+    woz_jaren = [p[:4] for p in peildata_sorted]
+    headers = _ADRES_HEADERS + ["€/m²", "% 1jr", "% 5jr", f"% sinds {oudst_jaar}"] + woz_jaren
+    widths = [11, 8, 6, 8, 28, 16, 38] + [10, 9, 9, 12] + [12] * len(woz_jaren)
+    _stijl_subtab_header(ws, _RED_MID, headers, widths)
+
+    n_adres = len(_ADRES_HEADERS)
+    n_afg = 4
+
+    for res in resultaten:
+        if not res.get("wozWaarden"):
+            continue
+        row = _adres_kolommen(res) + [
+            res.get("woz_per_m2"),
+            res.get("pct_1jr"),
+            res.get("pct_5jr"),
+            res.get("pct_sinds_oudst"),
+        ]
+        waarden_map = {w["peildatum"]: w["vastgesteldeWaarde"] for w in res.get("wozWaarden") or []}
+        for p in peildata_sorted:
+            row.append(waarden_map.get(p))
+        ws.append(row)
+
+    max_row = ws.max_row
+    max_col = len(headers)
+    _zebra_en_borders(ws, max_col)
+
+    # Formats: €/m², percentages, WOZ-kolommen
+    afg_start = n_adres + 1
+    for r in range(3, max_row + 1):
+        ws.cell(row=r, column=afg_start).number_format = '"€" #,##0'
+        for off in (1, 2, 3):
+            ws.cell(row=r, column=afg_start + off).number_format = "0.0\"%\""
+            ws.cell(row=r, column=afg_start + off).alignment = Alignment(horizontal="right")
+
+    # Diverging color-scale op trend-kolommen
+    if max_row >= 3:
+        for off in (1, 2, 3):
+            col_letter = get_column_letter(afg_start + off)
+            rng = f"{col_letter}3:{col_letter}{max_row}"
+            ws.conditional_formatting.add(rng, ColorScaleRule(
+                start_type="num", start_value=-20, start_color="E57373",
+                mid_type="num", mid_value=0, mid_color="FFFFFF",
+                end_type="num", end_value=50, end_color="81C784",
+            ))
+
+    # WOZ-kolommen euro + heatmap
+    woz_start = afg_start + n_afg
+    for c_idx in range(woz_start, max_col + 1):
+        for r in range(3, max_row + 1):
+            ws.cell(row=r, column=c_idx).number_format = '"€" #,##0'
+        if max_row >= 3:
+            rng = f"{get_column_letter(c_idx)}3:{get_column_letter(c_idx)}{max_row}"
+            ws.conditional_formatting.add(rng, ColorScaleRule(
+                start_type="min", start_color="FFFFFF",
+                mid_type="percentile", mid_value=50, mid_color="DCE6F2",
+                end_type="max", end_color="9BB8DC",
+            ))
+
+    ws.freeze_panes = ws.cell(row=3, column=n_adres + 1)
+    if max_row >= 2:
+        ws.auto_filter.ref = f"A2:{get_column_letter(max_col)}{max_row}"
+
+
+def _bouw_tab_energielabel(wb, resultaten) -> None:
+    ws = wb.create_sheet("Energielabel")
+    headers = _ADRES_HEADERS + ["label", "bouwjaar (EP)", "gebouwklasse", "gebouwtype",
+                                 "geldig t/m", "geregistreerd", "berekend verbruik"]
+    widths = [11, 8, 6, 8, 28, 16, 38, 9, 12, 14, 22, 12, 14, 14]
+    _stijl_subtab_header(ws, "1B7A3A", headers, widths)
+
+    n_adres = len(_ADRES_HEADERS)
+    for res in resultaten:
+        ep = res.get("energielabel") or {}
+        if not ep.get("energieklasse"):
+            continue
+        ws.append(_adres_kolommen(res) + [
+            ep.get("energieklasse"),
+            ep.get("bouwjaar"),
+            ep.get("gebouwklasse"),
+            ep.get("gebouwtype"),
+            ep.get("geldig_tot"),
+            ep.get("registratiedatum"),
+            ep.get("berekend_energieverbruik"),
+        ])
+
+    max_row = ws.max_row
+    max_col = len(headers)
+    _zebra_en_borders(ws, max_col)
+
+    # Kleur de label-cel
+    label_col = n_adres + 1
+    for r in range(3, max_row + 1):
+        c = ws.cell(row=r, column=label_col)
+        lab = (c.value or "").strip() if isinstance(c.value, str) else ""
+        if lab in _LABEL_FILL:
+            c.fill = PatternFill("solid", fgColor=_LABEL_FILL[lab])
+            c.font = Font(bold=True, color="1F2933" if lab == "D" else "FFFFFF", size=11)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        ws.cell(row=r, column=n_adres + 2).number_format = "0"
+        ws.cell(row=r, column=n_adres + 2).alignment = Alignment(horizontal="center")
+
+    ws.freeze_panes = ws.cell(row=3, column=n_adres + 1)
+    if max_row >= 2:
+        ws.auto_filter.ref = f"A2:{get_column_letter(max_col)}{max_row}"
+
+
+def _bouw_tab_bag(wb, resultaten) -> None:
+    ws = wb.create_sheet("BAG")
+    headers = _ADRES_HEADERS + ["bouwjaar", "gebr.opp. (m²)", "gebruiksdoel",
+                                 "vbo-status", "pand-id", "pand-status"]
+    widths = [11, 8, 6, 8, 28, 16, 38, 10, 12, 22, 22, 18, 22]
+    _stijl_subtab_header(ws, "8B5A2B", headers, widths)
+
+    n_adres = len(_ADRES_HEADERS)
+    for res in resultaten:
+        bag = res.get("bag") or {}
+        if not bag.get("bouwjaar") and not bag.get("gebruiksoppervlakte"):
+            continue
+        ws.append(_adres_kolommen(res) + [
+            bag.get("bouwjaar"),
+            bag.get("gebruiksoppervlakte"),
+            bag.get("gebruiksdoel"),
+            bag.get("vbo_status"),
+            bag.get("pand_id"),
+            bag.get("pand_status"),
+        ])
+
+    max_row = ws.max_row
+    max_col = len(headers)
+    _zebra_en_borders(ws, max_col)
+
+    for r in range(3, max_row + 1):
+        ws.cell(row=r, column=n_adres + 1).number_format = "0"
+        ws.cell(row=r, column=n_adres + 1).alignment = Alignment(horizontal="center")
+        ws.cell(row=r, column=n_adres + 2).number_format = "0"
+        ws.cell(row=r, column=n_adres + 2).alignment = Alignment(horizontal="center")
+
+    ws.freeze_panes = ws.cell(row=3, column=n_adres + 1)
+    if max_row >= 2:
+        ws.auto_filter.ref = f"A2:{get_column_letter(max_col)}{max_row}"
+
+
+def _bouw_tab_buurt(wb, resultaten) -> None:
+    ws = wb.create_sheet("CBS-buurt")
+    headers = _ADRES_HEADERS + ["buurt", "gemeente", "inwoners", "dichtheid /km²",
+                                 "gem. WOZ buurt", "gem. inkomen", "% huur", "% koop",
+                                 "huishoudgrootte", "woningvoorraad"]
+    widths = [11, 8, 6, 8, 28, 16, 38, 22, 16, 10, 13, 14, 14, 8, 8, 13, 13]
+    _stijl_subtab_header(ws, "0F766E", headers, widths)
+
+    n_adres = len(_ADRES_HEADERS)
+    for res in resultaten:
+        cbs = res.get("cbs") or {}
+        if not cbs.get("buurtnaam"):
+            continue
+        ws.append(_adres_kolommen(res) + [
+            cbs.get("buurtnaam"),
+            cbs.get("gemeentenaam"),
+            cbs.get("aantal_inwoners"),
+            cbs.get("bevolkingsdichtheid"),
+            cbs.get("gem_woningwaarde"),
+            cbs.get("gem_inkomen"),
+            cbs.get("pct_huur"),
+            cbs.get("pct_koop"),
+            cbs.get("huishoudgrootte"),
+            cbs.get("woningvoorraad"),
+        ])
+
+    max_row = ws.max_row
+    max_col = len(headers)
+    _zebra_en_borders(ws, max_col)
+
+    for r in range(3, max_row + 1):
+        ws.cell(row=r, column=n_adres + 5).number_format = '"€" #,##0'  # gem WOZ
+        ws.cell(row=r, column=n_adres + 6).number_format = '"€" #,##0'  # gem inkomen
+        for off in (7, 8):
+            ws.cell(row=r, column=n_adres + off).number_format = "0\"%\""
+            ws.cell(row=r, column=n_adres + off).alignment = Alignment(horizontal="center")
+
+    ws.freeze_panes = ws.cell(row=3, column=n_adres + 1)
+    if max_row >= 2:
+        ws.auto_filter.ref = f"A2:{get_column_letter(max_col)}{max_row}"
+
+
+def _bouw_tab_monumenten(wb, resultaten) -> None:
+    ws = wb.create_sheet("Monumenten")
+    headers = _ADRES_HEADERS + ["monumentnummer", "RCE straat", "RCE huisnr"]
+    widths = [11, 8, 6, 8, 28, 16, 38, 14, 22, 12]
+    _stijl_subtab_header(ws, "7C3AED", headers, widths)
+
+    n_adres = len(_ADRES_HEADERS)
+    for res in resultaten:
+        mon = res.get("monument") or {}
+        if not mon.get("monumentnummer"):
+            continue
+        ws.append(_adres_kolommen(res) + [
+            mon.get("monumentnummer"),
+            mon.get("monument_straat"),
+            mon.get("monument_huisnummer"),
+        ])
+
+    max_row = ws.max_row
+    max_col = len(headers)
+    _zebra_en_borders(ws, max_col)
+
+    # Kleur monumentnummer-cel
+    for r in range(3, max_row + 1):
+        c = ws.cell(row=r, column=n_adres + 1)
+        c.fill = PatternFill("solid", fgColor="7C3AED")
+        c.font = Font(bold=True, color="FFFFFF")
+        c.alignment = Alignment(horizontal="center")
+
+    ws.freeze_panes = ws.cell(row=3, column=n_adres + 1)
+    if max_row >= 2:
+        ws.auto_filter.ref = f"A2:{get_column_letter(max_col)}{max_row}"
+
+    if max_row < 3:
+        info = ws.cell(row=3, column=1, value="Geen rijksmonumenten in deze batch.")
+        info.font = Font(italic=True, color="6B7785")
+        ws.merge_cells(start_row=3, start_column=1, end_row=3, end_column=max_col)
+
+
+def _bouw_tab_matchwarnings(wb, resultaten) -> None:
+    """Lijst van rijen waar match-status of straat-verificatie iets opviel."""
+    ws = wb.create_sheet("Match-controle")
+    headers = ["status", "match-modus", "adres-invoer", "postcode", "huisnr",
+               "letter", "toev", "gevonden straat", "straat-invoer",
+               "straat verschilt?", "fallback?", "fallback-reden"]
+    widths = [22, 14, 38, 11, 8, 6, 8, 22, 22, 9, 9, 30]
+    _stijl_subtab_header(ws, "B45309", headers, widths)
+
+    for res in resultaten:
+        status = res.get("status", "")
+        modus = res.get("match_modus", "")
+        verschil = bool(res.get("straat_verschilt"))
+        fallback = modus == "fuzzy-fallback"
+        # Toon alleen rijen die opvallend zijn
+        if status == "OK" and not verschil and not fallback and modus == "strict":
+            continue
+        ws.append([
+            status,
+            modus,
+            res.get("adres_invoer", ""),
+            res.get("postcode") or "",
+            res.get("huisnummer") or "",
+            res.get("huisletter") or "",
+            res.get("huisnummertoevoeging") or "",
+            res.get("straat") or "",
+            res.get("straat_invoer") or "",
+            "ja" if verschil else "",
+            "ja" if fallback else "",
+            res.get("fallback_reden") or "",
+        ])
+
+    max_row = ws.max_row
+    max_col = len(headers)
+    _zebra_en_borders(ws, max_col)
+
+    # Markeer rijen met straat-verschil oranje
+    verschil_col = 10
+    fallback_col = 11
+    for r in range(3, max_row + 1):
+        if ws.cell(row=r, column=verschil_col).value == "ja":
+            for c_idx in range(1, max_col + 1):
+                ws.cell(row=r, column=c_idx).fill = PatternFill("solid", fgColor="FFE8D6")
+        if ws.cell(row=r, column=fallback_col).value == "ja":
+            ws.cell(row=r, column=fallback_col).fill = PatternFill("solid", fgColor="FFF4D6")
+            ws.cell(row=r, column=fallback_col).font = Font(bold=True, color="8a5a00")
+
+    ws.freeze_panes = ws.cell(row=3, column=4)
+    if max_row >= 2:
+        ws.auto_filter.ref = f"A2:{get_column_letter(max_col)}{max_row}"
+
+    if max_row < 3:
+        info = ws.cell(row=3, column=1, value="Alle adressen strict op postcode+huisnummer gematcht, geen afwijkingen.")
+        info.font = Font(italic=True, color="1f7a3a")
+        ws.merge_cells(start_row=3, start_column=1, end_row=3, end_column=max_col)
 
 
 @app.route("/api/template")
