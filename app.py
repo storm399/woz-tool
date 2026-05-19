@@ -62,6 +62,24 @@ REQUEST_TIMEOUT = 15
 session = requests.Session()
 
 
+def _get_with_retry(url, *, headers=None, params=None, max_tries=3, base_delay=0.4):
+    """GET met retry op timeouts en 5xx. Returnt (Response | None, fout_reden | None)."""
+    last_reden = None
+    for poging in range(max_tries):
+        try:
+            r = session.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+            if r.status_code < 500:
+                return r, None  # 2xx, 3xx, 4xx → klaar
+            last_reden = f"HTTP {r.status_code}"
+        except requests.Timeout:
+            last_reden = "timeout"
+        except requests.RequestException as e:
+            last_reden = f"net: {type(e).__name__}"
+        if poging < max_tries - 1:
+            time.sleep(base_delay * (2 ** poging))  # 0.4s, 0.8s
+    return None, last_reden
+
+
 def _normaliseer(s: str) -> str:
     """Normaliseert adres-string voor match-vergelijking."""
     if not s:
@@ -251,20 +269,27 @@ def zoek_adres_strict(
     return docs[0]
 
 
-def haal_woz(nummeraanduiding_id: str) -> Optional[dict]:
-    """Haalt WOZ-waarden op via Kadaster-API. Returnt dict of None bij 404."""
+def haal_woz(nummeraanduiding_id: str) -> dict:
+    """Haalt WOZ-waarden op via Kadaster-API met retry.
+
+    Returnt dict met sleutel 'status':
+      - 'ok'            : data is gevuld
+      - 'geen_data'     : 404 — geen WOZ-waarde geregistreerd (bv. niet-woning)
+      - 'api_fout'      : timeout / 5xx / netwerkfout (na retries)
+    """
+    if not nummeraanduiding_id:
+        return {"status": "geen_data", "data": None, "reden": None}
+    r, reden = _get_with_retry(WOZ_API.format(nummeraanduiding_id), headers=WOZ_HEADERS)
+    if r is None:
+        return {"status": "api_fout", "data": None, "reden": reden}
+    if r.status_code == 404:
+        return {"status": "geen_data", "data": None, "reden": None}
+    if r.status_code != 200:
+        return {"status": "api_fout", "data": None, "reden": f"HTTP {r.status_code}"}
     try:
-        r = session.get(
-            WOZ_API.format(nummeraanduiding_id),
-            headers=WOZ_HEADERS,
-            timeout=REQUEST_TIMEOUT,
-        )
-        if r.status_code == 404:
-            return None
-        r.raise_for_status()
-        return r.json()
-    except requests.RequestException:
-        return None
+        return {"status": "ok", "data": r.json(), "reden": None}
+    except ValueError:
+        return {"status": "api_fout", "data": None, "reden": "Ongeldige JSON"}
 
 
 def haal_bag(adresseerbaar_object_id: str) -> Optional[dict]:
@@ -410,43 +435,41 @@ def haal_monument(pand_id: str) -> Optional[dict]:
 
 
 def haal_energielabel(adresseerbaar_object_id: str) -> Optional[dict]:
-    """Haalt het meest recente energielabel op via EP-online.
+    """Haalt het meest recente energielabel op via EP-online (met retry).
 
     Returnt dict met velden energieklasse, registratiedatum, geldig_tot,
-    bouwjaar, gebouwtype — of None als er geen label is.
+    bouwjaar, gebouwtype, plus 'fout'-veld bij API-storing — of None als
+    er geen label is (echte 404).
     """
-    if not EPO_API_KEY:
+    if not EPO_API_KEY or not adresseerbaar_object_id:
         return None
+    r, reden = _get_with_retry(
+        EPO_API.format(adresseerbaar_object_id),
+        headers={"Authorization": EPO_API_KEY, "Accept": "application/json"},
+    )
+    if r is None:
+        return {"fout": f"EP-online niet bereikbaar ({reden})"}
+    if r.status_code == 404:
+        return None
+    if r.status_code != 200:
+        return {"fout": f"EP-online HTTP {r.status_code}"}
     try:
-        r = session.get(
-            EPO_API.format(adresseerbaar_object_id),
-            headers={"Authorization": EPO_API_KEY, "Accept": "application/json"},
-            timeout=REQUEST_TIMEOUT,
-        )
-        if r.status_code == 404:
-            return None
-        r.raise_for_status()
         data = r.json()
-        if not data:
-            return None
-        # Meest recente label (hoogste registratiedatum)
-        labels = sorted(
-            data,
-            key=lambda x: x.get("Registratiedatum") or "",
-            reverse=True,
-        )
-        latest = labels[0]
-        return {
-            "energieklasse": latest.get("Energieklasse"),
-            "registratiedatum": (latest.get("Registratiedatum") or "")[:10],
-            "geldig_tot": (latest.get("Geldig_tot") or "")[:10],
-            "bouwjaar": latest.get("Bouwjaar"),
-            "gebouwtype": latest.get("Gebouwtype"),
-            "gebouwklasse": latest.get("Gebouwklasse"),
-            "berekend_energieverbruik": latest.get("BerekendeEnergieverbruik"),
-        }
-    except requests.RequestException:
+    except ValueError:
+        return {"fout": "EP-online: ongeldige JSON"}
+    if not data:
         return None
+    labels = sorted(data, key=lambda x: x.get("Registratiedatum") or "", reverse=True)
+    latest = labels[0]
+    return {
+        "energieklasse": latest.get("Energieklasse"),
+        "registratiedatum": (latest.get("Registratiedatum") or "")[:10],
+        "geldig_tot": (latest.get("Geldig_tot") or "")[:10],
+        "bouwjaar": latest.get("Bouwjaar"),
+        "gebouwtype": latest.get("Gebouwtype"),
+        "gebouwklasse": latest.get("Gebouwklasse"),
+        "berekend_energieverbruik": latest.get("BerekendeEnergieverbruik"),
+    }
 
 
 def _resultaat_uit_hit(hit: dict, adres_invoer: str, ref_straat: Optional[str] = None) -> dict:
@@ -473,6 +496,7 @@ def _resultaat_uit_hit(hit: dict, adres_invoer: str, ref_straat: Optional[str] =
     cbs = haal_cbs_buurt(buurtcode) if buurtcode else None
     monument = haal_monument(bag.get("pand_id") if bag else None)
 
+    # Basis-velden altijd uit PDOK (zodat ze ook gevuld zijn bij WOZ-API-storing)
     base = {
         "adres_invoer": adres_invoer,
         "weergavenaam": weergavenaam,
@@ -480,13 +504,29 @@ def _resultaat_uit_hit(hit: dict, adres_invoer: str, ref_straat: Optional[str] =
         "adresseerbaarobject_id": adresseerbaar_object_id,
         "buurtnaam": buurtnaam,
         "buurtcode": buurtcode,
+        "straat": hit.get("straatnaam"),
+        "huisnummer": hit.get("huisnummer"),
+        "huisletter": hit.get("huisletter"),
+        "huisnummertoevoeging": hit.get("huisnummertoevoeging"),
+        "postcode": hit.get("postcode"),
+        "woonplaats": hit.get("woonplaatsnaam"),
         "bag": bag,
         "energielabel": energielabel,
         "cbs": cbs,
         "monument": monument,
+        "woz_api_status": woz.get("status"),
     }
 
-    if not woz:
+    if woz.get("status") == "api_fout":
+        base.update({
+            "status": f"WOZ-API tijdelijk niet bereikbaar ({woz.get('reden')})",
+            "wozWaarden": [],
+        })
+        _bereken_afgeleiden(base)
+        _verifieer_straat(base, ref_straat, hit)
+        return base
+
+    if woz.get("status") != "ok" or not woz.get("data"):
         base.update({
             "status": "Geen WOZ-waarde bekend (niet-woning of onbekend)",
             "wozWaarden": [],
@@ -495,8 +535,8 @@ def _resultaat_uit_hit(hit: dict, adres_invoer: str, ref_straat: Optional[str] =
         _verifieer_straat(base, ref_straat, hit)
         return base
 
-    obj = woz.get("wozObject", {}) or {}
-    waarden = woz.get("wozWaarden", []) or []
+    obj = (woz["data"].get("wozObject") or {}) if woz.get("data") else {}
+    waarden = (woz["data"].get("wozWaarden") or []) if woz.get("data") else []
     base.update({
         "status": "OK",
         "wozobjectnummer": obj.get("wozobjectnummer"),
@@ -665,80 +705,127 @@ def api_excel():
         return " ".join(parts).strip()
 
     def _parse_huisnr_combo(s):
-        """Splitst '12A' / '12-2' / '12 bis' in (nummer, letter, toevoeging)."""
+        """Splitst '12A' / '12-2' / '12 bis' in (nummer, letter, toevoeging).
+
+        Conservatief: alleen 1 letter ná het nummer wordt als huisletter behandeld.
+        Alles erna (eventueel na streepje/spatie) is toevoeging.
+        """
         s = str(s).strip()
-        m = re.match(r"^(\d+)\s*([A-Za-z])?\s*[-/]?\s*(.*)$", s)
+        # Match: cijfers, optioneel 1 letter, optioneel sep+resterend
+        m = re.match(r"^(\d{1,5})\s*([A-Za-z])?\s*(?:[-/\s]\s*([A-Za-z0-9]{1,4}))?\s*$", s)
         if not m:
             return None, None, None
         return m.group(1), (m.group(2) or None), (m.group(3) or None)
 
+    def _parse_uit_adresstring(adres: str):
+        """Trekt postcode en huisnummer (+toev) uit een vrije adresstring.
+
+        Pakt de LAATSTE postcode-achtige match (NL-adres: postcode komt
+        typisch ná het huisnummer). Returnt (None,..) als niet ondubbelzinnig.
+        """
+        if not adres:
+            return None, None, None, None
+        pc_matches = list(re.finditer(r"\b([1-9]\d{3})\s?([A-Za-z]{2})\b", adres))
+        if not pc_matches:
+            return None, None, None, None
+        # Filter: de letters mogen geen onderdeel zijn van een groter woord
+        # (regex \b doet dat al). Pak de LAATSTE als er meerdere zijn.
+        pc_match = pc_matches[-1]
+        pc = pc_match.group(1) + pc_match.group(2).upper()
+        voor_pc = adres[:pc_match.start()].strip().rstrip(",").strip()
+        nr_match = re.search(r"(\d{1,5})\s*([A-Za-z])?\s*(?:[-/\s]\s*([A-Za-z0-9]{1,4}))?\s*$", voor_pc)
+        if not nr_match:
+            return None, None, None, None
+        try:
+            nr = int(nr_match.group(1))
+        except ValueError:
+            return None, None, None, None
+        return pc, nr, (nr_match.group(2) or None), (nr_match.group(3) or None)
+
     def _strict_kwargs(row):
-        """Probeert postcode + huisnummer uit de rij te halen voor strict-match."""
-        pc = _val(row, postcode_idx)
-        nr = _val(row, huisnummer_idx)
+        """Bouwt match-key (postcode+huisnummer) uit de rij. None als niet betrouwbaar.
+
+        Volgorde:
+        1) Losse postcode-kolom + losse huisnummer-kolom (+ letter/toev kolommen)
+        2) Uit vrije 'adres'-kolom: parse postcode + huisnummer.
+        Bij twijfel (geen postcode of geen huisnummer): None → status 'Geen postcode+huisnummer'.
+        Straatnaam wordt nooit als match-key gebruikt, alleen ter verificatie.
+        """
+        pc_raw = _val(row, postcode_idx)
+        nr_raw = _val(row, huisnummer_idx)
         letter = _val(row, letter_idx)
         toev = _val(row, toevoeging_idx)
         straat = _val(row, straat_idx)
         plaats = _val(row, plaats_idx)
 
-        if pc and nr is not None:
-            # Als nummer in het veld als '12A' staat, splits letter eruit
-            if letter is None and isinstance(nr, str) and re.search(r"[A-Za-z]", nr):
-                num, lt, tv = _parse_huisnr_combo(nr)
-                nr = num or nr
-                letter = letter or lt
-                toev = toev or tv
-            return {
-                "postcode": pc,
-                "huisnummer": nr,
-                "huisletter": letter,
-                "huisnummertoevoeging": toev,
-                "straat": straat,
-                "plaats": plaats,
-            }
-        # Probeer ook uit een vrije adres-string een postcode+nr te halen
-        if adres_idx is not None and row[adres_idx]:
-            adres = str(row[adres_idx])
-            pc_match = re.search(r"\b([1-9]\d{3}\s?[A-Za-z]{2})\b", adres)
-            nr_match = re.search(r"\b(\d{1,5})\b", adres)
-            if pc_match and nr_match:
-                # Eerste cijferreeks die NIET binnen postcode valt
-                nrs = re.findall(r"\b(\d{1,5})\b", adres)
-                pc_digits = pc_match.group(1)[:4]
-                nrs_clean = [n for n in nrs if n != pc_digits]
-                if nrs_clean:
-                    return {
-                        "postcode": pc_match.group(1),
-                        "huisnummer": nrs_clean[0],
-                        "huisletter": None,
-                        "huisnummertoevoeging": None,
-                        "straat": straat,
-                        "plaats": plaats,
-                    }
-        return None
+        pc = _norm_postcode(pc_raw) if pc_raw else None
+        nr = letter_out = toev_out = None
 
-    # Verzamel resultaten — postcode+huisnummer leidend, fallback op fuzzy
+        if pc and nr_raw not in (None, "", 0):
+            # Als huisnummer als '12A' / '12-2' staat, splits dat
+            num, lt, tv = _parse_huisnr_combo(str(nr_raw))
+            if num is None:
+                # Niet te splitsen; probeer puur int
+                try:
+                    nr = int(str(nr_raw).strip())
+                except ValueError:
+                    nr = None
+            else:
+                try:
+                    nr = int(num)
+                except ValueError:
+                    nr = None
+                letter_out = letter or lt
+                toev_out = toev or tv
+            if letter and not letter_out:
+                letter_out = letter
+            if toev and not toev_out:
+                toev_out = toev
+
+        # Fallback: parsen uit vrije adres-string
+        if (not pc or nr is None) and adres_idx is not None and row[adres_idx]:
+            p_pc, p_nr, p_lt, p_tv = _parse_uit_adresstring(str(row[adres_idx]))
+            if p_pc and p_nr is not None:
+                pc = pc or p_pc
+                nr = nr if nr is not None else p_nr
+                letter_out = letter_out or p_lt
+                toev_out = toev_out or p_tv
+
+        # Validatie: pc moet 1234AB-formaat zijn en nr moet integer zijn
+        if not pc or not re.match(r"^[1-9]\d{3}[A-Z]{2}$", pc) or nr is None:
+            return None
+
+        return {
+            "postcode": pc,
+            "huisnummer": nr,
+            "huisletter": _norm_letter(letter_out),
+            "huisnummertoevoeging": _norm_toev(toev_out),
+            "straat": straat,
+            "plaats": plaats,
+        }
+
+    # Verzamel resultaten — STRIKT op postcode+huisnummer, geen fuzzy fallback
     resultaten = []
     peildata = set()
     for row in rows[1:]:
         adres_label = _adres_label(row)
         if not adres_label:
-            resultaten.append({"adres_invoer": "", "status": "Leeg", "wozWaarden": []})
+            resultaten.append({"adres_invoer": "", "status": "Leeg", "wozWaarden": [],
+                                "match_modus": "geen"})
             continue
 
         strict = _strict_kwargs(row)
-        if strict:
-            res = maak_resultaat_strict(adres_invoer=adres_label, **strict)
-            # Als strict niets vond, val terug op fuzzy als noodgreep
-            if res.get("status", "").startswith("Adres niet gevonden"):
-                fb = maak_resultaat(adres_label)
-                if fb.get("status") == "OK":
-                    fb["match_modus"] = "fuzzy-fallback"
-                    fb["fallback_reden"] = "strict op postcode+huisnummer leverde geen hit"
-                    res = fb
-        else:
-            res = maak_resultaat(adres_label)
-            res["match_modus"] = "fuzzy"
+        if not strict:
+            resultaten.append({
+                "adres_invoer": adres_label,
+                "status": "Geen postcode + huisnummer in rij (overgeslagen voor veiligheid)",
+                "wozWaarden": [],
+                "match_modus": "geen",
+            })
+            continue
+
+        res = maak_resultaat_strict(adres_invoer=adres_label, **strict)
+        # NOOIT terugvallen op fuzzy — liever geen match dan een verkeerde
 
         for w in res.get("wozWaarden") or []:
             if w.get("peildatum"):
