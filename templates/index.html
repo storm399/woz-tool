@@ -299,9 +299,13 @@
     <div class="card">
       <h2>Batch: Excel uploaden</h2>
       <p class="help">
-        Upload een Excel met een kolom <strong>adres</strong> (één adres per rij),
-        óf met losse kolommen <code>straat</code>, <code>huisnummer</code>, <code>postcode</code>, <code>plaats</code>.
-        Je krijgt direct een ingevuld Excel-bestand terug.
+        Voor bulk-verwerking gebruikt de tool <strong>strikte matching op postcode + huisnummer</strong>
+        (eventueel aangevuld met huisletter/toevoeging). Zo voorkomen we
+        valse matches op dezelfde straatnaam in een andere stad.
+        Geef losse kolommen mee — <code>postcode</code> en <code>huisnummer</code> zijn verplicht;
+        <code>huisletter</code>, <code>toevoeging</code>, <code>straat</code> en <code>plaats</code> zijn optioneel.
+        Rijen zonder postcode of zonder exacte match worden gemarkeerd als "geen match"
+        in plaats van foutief gekoppeld.
       </p>
 
       <form id="batchForm">
